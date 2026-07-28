@@ -107,3 +107,23 @@ def test_drive_and_loan_read_the_same_physical_row():
     """There is no DMV feed. dl_number is a column on payday-loan rows."""
     assert SHAPES["drive"].fields["dl_num"].key == "dl_number"
     assert SHAPES["loan"].fields["employer"].key == "employer"
+
+
+def test_no_two_distinct_derived_fields_in_a_shape_collapse_to_one_origin():
+    """derived() takes its comparable `key` from fn.__name__ because FieldOrigin.fn
+    is compare=False. A factory that forgets to set __name__ makes every closure
+    `_fn`, so distinct fields silently compare equal and a mis-wiring becomes
+    invisible. Deleting the __name__ line in derive.first_raw previously failed
+    no test at all.
+    """
+    for shape in SHAPES.values():
+        derived_fields = [(n, o) for n, o in shape.fields.items() if o.kind == "derived"]
+        for i, (name_a, origin_a) in enumerate(derived_fields):
+            for name_b, origin_b in derived_fields[i + 1:]:
+                if origin_a.fn is origin_b.fn:
+                    continue  # genuinely the same function, e.g. id and tax_id
+                assert origin_a != origin_b, (
+                    f"{shape.name}.{name_a} and {shape.name}.{name_b} are backed by "
+                    f"different functions but compare equal — a factory in derive.py "
+                    f"is not setting _fn.__name__"
+                )
