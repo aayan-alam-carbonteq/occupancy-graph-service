@@ -12,7 +12,7 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0",
-    "pytest-asyncio>=0.24",
+    "pytest-asyncio>=1.0",
 ]
 
 [project.scripts]
@@ -31,3 +31,7 @@ where = ["src"]
 pythonpath = ["src", "tests"]
 asyncio_mode = "auto"
 markers = ["live: hits the real partner DB; requires PARTNER_DSN and network"]
+filterwarnings = [
+    "error:coroutine .* was never awaited:RuntimeWarning",
+    "error::pytest.PytestUnraisableExceptionWarning",
+]
