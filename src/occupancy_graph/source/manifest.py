@@ -149,4 +149,161 @@ TAX = ShapeSpec(
     },
 )
 
-SHAPES: dict[str, ShapeSpec] = {"tax": TAX}
+UTILITY = ShapeSpec(
+    name="utility", graphql_type="UtilityRecord",
+    collection_field="utilities", singular_field="utility", id_linked=False,
+    fields={
+        # The utility feed carries NO raw_data at all (0% in production) and no
+        # date field of any kind. Every field is a plain column.
+        "first_name": col("first_name"),
+        "last_name": col("last_name"),
+        "middle_name": col("middle_name"),
+        "dob": col("dob"),
+        "dod": col("dod"),
+        "address": col("address"),
+        "city": col("city"),
+        "county": col("county"),
+        "state": col("state"),
+        "zip": col("zip"),
+        "phone": col("phone"),
+    },
+)
+
+TRACE = ShapeSpec(
+    name="trace", graphql_type="TraceRecord",
+    collection_field="traces", singular_field="trace", id_linked=True,
+    fields={
+        "id": derived(derive.synthetic_id),
+        "trace_id": derived(derive.synthetic_id),
+        "phone": col("phone"),
+        "cellphone": col("mobile"),
+        "email": col("email"),
+        "email_02": raw("Email_02"),
+        "email_03": raw("Email_03"),
+        "housenumber": derived(derive.house_number),
+        "address": col("address"),
+        "city": col("city"),
+        "state": col("state"),
+        "zip": col("zip"),
+        "county": col("county"),
+        "firstname": col("first_name"),
+        "middlename": col("middle_name"),
+        "lastname": col("last_name"),
+        "dob_day": raw("Date_Of_Birth_Day"),
+        "dob_month": raw("Date_Of_Birth_Month"),
+        "dob_year": raw("Date_Of_Birth_Year"),
+        "credit_capacity": raw("Credit_Capacity"),
+        "home_built_year": raw("Home_Built_Year"),
+        "home_purchase_date": raw("Home_Purchase_Date"),
+        "income_description": raw("Income_Description"),
+    },
+)
+
+LOAN = ShapeSpec(
+    name="loan", graphql_type="LoanRecord",
+    collection_field="loans", singular_field="loan", id_linked=True,
+    fields={
+        "id": derived(derive.synthetic_id),
+        "loan_id": derived(derive.synthetic_id),
+        "loan_amount": raw("loan_amount"),
+        "monthly_income": raw("monthly_income"),
+        "month_pay": raw("month_pay"),
+        "own_rent": col("own_rent"),  # normalized in quality.py
+        "employer": col("employer"),
+        "occupation": col("occupation"),
+        "address": col("address"),
+        "zip": col("zip"),
+        "firstname": col("first_name"),
+        "lastname": col("last_name"),
+    },
+)
+
+DRIVE = ShapeSpec(
+    name="drive", graphql_type="DriveRecord",
+    collection_field="drives", singular_field="drive", id_linked=True,
+    fields={
+        # There is no DMV feed in the partner corpus. These are payday-loan rows
+        # that happen to carry a licence number — the SAME physical rows the loan
+        # shape reads. See the spec: policy.ts currently weights `drive` at 1.15
+        # as if it were an independent source, which double-counts. Fixing that
+        # is engine-side and out of scope here.
+        "id": derived(derive.synthetic_id),
+        "drive_id": derived(derive.synthetic_id),
+        "dl_num": col("dl_number"),
+        "dl_state": col("dl_state"),
+        "zip": col("zip"),
+        "address": col("address"),
+        "firstname": col("first_name"),
+        "lastname": col("last_name"),
+    },
+)
+
+AUTO = ShapeSpec(
+    name="auto", graphql_type="AutoRecord",
+    collection_field="autos", singular_field="auto", id_linked=True,
+    fields={
+        "id": derived(derive.synthetic_id),
+        "auto_id": derived(derive.synthetic_id),
+        # The auto feed ships three casings of the same keys across its files.
+        "vin": derived(derive.first_raw("VIN", "Vin", "VIN_ID")),
+        "zip": col("zip"),
+        "city": col("city"),
+        "make": derived(derive.first_raw("MAKE", "Make")),
+        "model": derived(derive.first_raw("MODEL", "Model")),
+        "year": derived(derive.first_raw("MODEL_YEAR", "YEAR", "Year")),
+        "phone": col("phone"),
+        "address": col("address"),
+        "housenumber": derived(derive.house_number),
+        "firstname": col("first_name"),
+        "lastname": col("last_name"),
+    },
+)
+
+BASE = ShapeSpec(
+    name="base", graphql_type="BaseRecord",
+    collection_field="baseRecords", singular_field="baseRecord", id_linked=True,
+    fields={
+        "firstname": col("first_name"),
+        "middlename": col("middle_name"),
+        "lastname": col("last_name"),
+        "housenumber": derived(derive.house_number),
+        "primaryaddress": col("address"),
+        "state": col("state"),
+        "zip": col("zip"),
+        "city": col("city"),
+        "phone": col("phone"),
+        "estimatedincomecode": col("estimated_income"),
+        # An H/R/9 code (homeowner / renter / unknown), NOT a probability.
+        "homeownerprobabilitymodel": col("home_owner_probability"),
+        "lengthofresidence": col("length_of_residence"),
+        "presenceofchildren": col("presence_of_children"),
+        "persongender": col("gender"),
+        "persondateofbirthyear": derived(derive.dob_year),
+        "persondateofbirthmonth": derived(derive.dob_month),
+        "persondateofbirthday": derived(derive.dob_day),
+        "personmaritalstatus": col("marital_status"),
+        "personeducation": col("education"),
+        "businessowner": col("business_owner"),
+        "creditrating": col("credit_rating"),
+        "networth": col("net_worth"),
+        "homepurchaseprice": col("home_purchase_price"),
+        "homepurchasedateyear": derived(derive.year_of("home_purchase_date")),
+        "homeyearbuilt": col("home_year_built"),
+        "estimatedcurrenthomevaluecode": col("estimated_home_value"),
+        # Already in thousands upstream (observed 3-598, avg 171). Direct mapping.
+        "mortgageamountinthousands": col("mortgage_amount"),
+        "mortgagelendername": col("mortgage_lender"),
+        "deeddateofrefinanceyear": derived(derive.year_of("refinance_date")),
+        "refinanceamountinthousands": col("refinance_amount"),
+        "refinancelendername": col("refinance_lender"),
+        "dob": col("dob"),
+        "id": derived(derive.synthetic_id),
+    },
+)
+
+# Order matters: it drives the order of Query root fields in the SDL. This is the
+# old SOURCE_FILES order with voter/criminal/linkedin removed.
+SHAPES: dict[str, ShapeSpec] = {
+    "base": BASE, "auto": AUTO, "drive": DRIVE,
+    "loan": LOAN, "tax": TAX, "trace": TRACE, "utility": UTILITY,
+}

@@ -149,3 +149,24 @@ def year_of(column: str) -> Callable[[Mapping[str, Any]], str | None]:
 
     _fn.__name__ = f"year_of_{column}"
     return _fn
+
+
+def first_raw(*keys: str) -> Callable[[Mapping[str, Any]], str | None]:
+    """First non-empty value among several raw_data keys.
+
+    The auto feed ships VIN/Vin/VIN_ID and MAKE/Make across different source
+    files; this is upstream inconsistency, not defensive padding.
+
+    `__name__` MUST be distinguishing — see the note on year_of().
+    """
+
+    def _fn(row: Mapping[str, Any]) -> str | None:
+        raw = _raw(row)
+        for key in keys:
+            value = _text(raw.get(key))
+            if value:
+                return value
+        return None
+
+    _fn.__name__ = "first_raw_" + "_".join(keys)
+    return _fn

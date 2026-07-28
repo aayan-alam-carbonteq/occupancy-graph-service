@@ -50,3 +50,60 @@ def test_fields_sharing_one_derive_function_still_compare_equal():
     """id and tax_id genuinely have the same origin."""
     fields = SHAPES["tax"].fields
     assert fields["id"] == fields["tax_id"]
+
+
+def test_every_surviving_shape_is_present_and_the_dead_ones_are_not():
+    assert set(SHAPES) == {"base", "tax", "utility", "trace", "auto", "loan", "drive"}
+
+
+def test_shape_column_lists_match_the_committed_contract_exactly():
+    """These are the upstream vendor's CSV headers. They are inconsistent between
+    shapes on purpose (utility uses first_name, trace uses firstname). The engine
+    reads SourceRecord.data by these exact keys."""
+    assert SHAPES["utility"].columns == (
+        "first_name", "last_name", "middle_name", "dob", "dod",
+        "address", "city", "county", "state", "zip", "phone",
+    )
+    assert SHAPES["loan"].columns == (
+        "id", "loan_id", "loan_amount", "monthly_income", "month_pay", "own_rent",
+        "employer", "occupation", "address", "zip", "firstname", "lastname",
+    )
+    assert SHAPES["drive"].columns == (
+        "id", "drive_id", "dl_num", "dl_state", "zip", "address", "firstname", "lastname",
+    )
+    assert SHAPES["auto"].columns == (
+        "id", "auto_id", "vin", "zip", "city", "make", "model", "year",
+        "phone", "address", "housenumber", "firstname", "lastname",
+    )
+    assert len(SHAPES["trace"].columns) == 23
+    assert len(SHAPES["base"].columns) == 33
+
+
+def test_norm_helpers_match_the_committed_contract_for_every_shape():
+    assert SHAPES["utility"].norm_fields == (
+        "firstname", "lastname", "name_key", "address", "address_zip_key", "phone",
+    )
+    assert SHAPES["drive"].norm_fields == (
+        "firstname", "lastname", "name_key", "address", "address_zip_key",
+    )
+    assert SHAPES["trace"].norm_fields == (
+        "firstname", "lastname", "name_key", "address", "address_zip_key",
+        "phone", "cellphone", "email", "email_02", "email_03",
+    )
+    assert SHAPES["base"].norm_fields == (
+        "firstname", "lastname", "name_key", "address", "address_zip_key",
+        "primaryaddress", "phone",
+    )
+
+
+def test_mortgage_amount_is_a_direct_mapping_because_it_is_already_in_thousands():
+    """Observed range on real data is 3-598 (avg 171). A /1000 would render a
+    $171k mortgage as 0.17."""
+    assert SHAPES["base"].fields["mortgageamountinthousands"].kind == "col"
+    assert SHAPES["base"].fields["mortgageamountinthousands"].key == "mortgage_amount"
+
+
+def test_drive_and_loan_read_the_same_physical_row():
+    """There is no DMV feed. dl_number is a column on payday-loan rows."""
+    assert SHAPES["drive"].fields["dl_num"].key == "dl_number"
+    assert SHAPES["loan"].fields["employer"].key == "employer"
