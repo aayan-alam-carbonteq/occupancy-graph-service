@@ -35,3 +35,18 @@ def test_tax_norm_helpers_match_the_committed_contract():
         "firstname", "lastname", "name_key", "address", "address_zip_key",
         "owneraddressline1",
     )
+
+
+def test_derived_origins_backed_by_different_functions_are_not_equal():
+    """fn is compare=False, so without a discriminator every derived() origin
+    would compare equal and a mis-wiring would be invisible."""
+    fields = SHAPES["tax"].fields
+    assert fields["zip"] != fields["county"]
+    assert fields["zip"].key == "tax_zip5"
+    assert fields["county"].key == "fips_county"
+
+
+def test_fields_sharing_one_derive_function_still_compare_equal():
+    """id and tax_id genuinely have the same origin."""
+    fields = SHAPES["tax"].fields
+    assert fields["id"] == fields["tax_id"]

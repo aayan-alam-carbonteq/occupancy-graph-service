@@ -52,8 +52,25 @@ def raw(key: str) -> FieldOrigin:
 
 
 def derived(fn: Callable[[Mapping[str, Any]], Any]) -> FieldOrigin:
-    """Value is computed from the row. `fn` receives the whole partner row."""
-    return FieldOrigin(kind="derived", fn=fn)
+    """Value is computed from the row.
+
+    `fn` receives the WHOLE partner row as a mapping of column name -> value,
+    with `raw_data` still NESTED under the "raw_data" key rather than flattened.
+    A derived function that needs a raw_data key reaches into it itself.
+
+    `key` carries the function's name so that two derived origins backed by
+    different functions are distinguishable by equality. `fn` itself is excluded
+    from comparison (compare=False), so without this every derived() origin would
+    compare equal to every other and a mis-wiring would be invisible to tests.
+
+    Factory-produced functions (e.g. a future `derive.year_of(column)` or
+    `derive.first_raw(*keys)` that returns an inner `_fn`) all share that inner
+    name by default, which would collapse back into the same blind spot. Any
+    such factory in `derive.py` MUST set `_fn.__name__` to something
+    distinguishing (e.g. `f"year_of_{column}"`, `f"first_raw_{'_'.join(keys)}"`)
+    before returning it.
+    """
+    return FieldOrigin(kind="derived", key=getattr(fn, "__name__", None), fn=fn)
 
 
 def absent() -> FieldOrigin:
