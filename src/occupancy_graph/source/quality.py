@@ -45,6 +45,8 @@ def tax_row_is_usable(row: Mapping[str, Any]) -> bool:
     of property_owner rows are affected. Three independent indicators; any one
     failing rejects the row.
     """
+    if not isinstance(row, Mapping):
+        return False
     raw = row.get("raw_data")
     if not isinstance(raw, Mapping):
         return False
@@ -56,6 +58,14 @@ def tax_row_is_usable(row: Mapping[str, Any]) -> bool:
         return False
     residential = _text(raw.get("residential"))
     if residential and residential not in _BOOLEANS:
+        return False
+    # The gate exists to stop a mislabelled owner reaching the model. If there is
+    # no ownerName there is nothing to mislabel, so sparse rows are fine. But when
+    # an owner name IS present we require corroboration that the row is aligned:
+    # `residential` is 100% populated on real property_owner rows, so its absence
+    # is itself anomalous. Without this, a shift severe enough to blank all three
+    # signals would pass — absence of evidence read as evidence of soundness.
+    if _text(raw.get("ownerName")) and residential not in _BOOLEANS:
         return False
     return True
 

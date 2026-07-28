@@ -61,3 +61,26 @@ def test_numeric_trace_fields_reject_garbage():
 
 def test_unknown_trace_fields_pass_through_untouched():
     assert quality.coerce_trace_field("Income_Description", "anything") == "anything"
+
+
+def test_sparse_row_with_no_owner_name_is_accepted():
+    # Nothing to mislabel when there is no ownerName at all -- pinned so the
+    # narrowness of the owner-corroboration rule stays deliberate.
+    assert quality.tax_row_is_usable({"raw_data": {}}) is True
+
+
+def test_owner_name_without_residential_corroboration_is_rejected():
+    assert quality.tax_row_is_usable(
+        {"raw_data": {"ownerName": "DOE, JANE"}}
+    ) is False
+
+
+def test_owner_name_with_residential_corroboration_is_accepted():
+    assert quality.tax_row_is_usable(
+        {"raw_data": {"ownerName": "DOE, JANE", "residential": "True"}}
+    ) is True
+
+
+@pytest.mark.parametrize("bad_row", [None, "nope", []])
+def test_non_mapping_row_is_rejected_not_raised(bad_row):
+    assert quality.tax_row_is_usable(bad_row) is False
