@@ -30,6 +30,8 @@ where = ["src"]
 [tool.pytest.ini_options]
 pythonpath = ["src", "tests"]
 asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "session"
+asyncio_default_test_loop_scope = "session"
 markers = ["live: hits the real partner DB; requires PARTNER_DSN and network"]
 filterwarnings = [
     "error:coroutine .* was never awaited:RuntimeWarning",
