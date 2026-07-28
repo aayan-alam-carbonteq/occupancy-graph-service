@@ -23,9 +23,13 @@ _FIPS_COUNTIES: dict[tuple[str, str], str] = {
 }
 
 # Tokens that mark an owner as a company, trust or estate rather than a person.
+# Every entry MUST be a single alphabetic word: company_from_owner_name()
+# tokenizes ownerName with re.split(r"[^A-Z]+", ...), which splits on any
+# non-alpha character, so a multi-word entry (e.g. the old "L L C") can never
+# equal one of the resulting tokens and is silently unreachable.
 _COMPANY_TOKENS = {
-    "LLC", "L L C", "INC", "INCORPORATED", "CORP", "CORPORATION", "CO",
-    "LP", "LLP", "LTD", "TRUST", "TRUSTEE", "PROPERTIES", "HOLDINGS",
+    "LLC", "INC", "INCORPORATED", "CORP", "CORPORATION", "CO",
+    "LP", "LLP", "LTD", "TRUST", "TRUSTEE", "TR", "PROPERTIES", "HOLDINGS",
     "PARTNERS", "PARTNERSHIP", "ASSOCIATES", "ENTERPRISES", "INVESTMENTS",
     "REALTY", "MANAGEMENT", "GROUP", "FOUNDATION", "CHURCH", "ESTATE",
     "BANK", "ASSOCIATION", "AUTHORITY", "COMPANY",
@@ -53,6 +57,11 @@ def tax_zip5(row: Mapping[str, Any]) -> str | None:
     The `zip` column is 0% populated on these rows; the value lives in
     raw_data.zipCodePlusFour as "40505-1046". On column-shifted rows that key
     holds "True"/"False", so anything that is not five leading digits is refused.
+
+    An all-digit `zip` column longer than 5 (e.g. a dash-less ZIP+4 like
+    "405051046") is truncated to its first 5 digits rather than rejected — that
+    is intentional, not a bug: it recovers the same 5-digit ZIP a dashed value
+    would have produced.
     """
     column = _text(row.get("zip"))
     if re.fullmatch(r"\d{5}", column[:5]) and column:
@@ -75,6 +84,20 @@ def company_from_owner_name(row: Mapping[str, Any]) -> str | None:
     The partner has no ownercompany column, but company/trust ownership is
     visible in ownerName. `company_or_trust_owner` is the only consumer, and it
     needs presence, not a parsed entity name — so the whole string is returned.
+
+    This is a token-set heuristic, not a parser, and it has known limits that
+    are deliberately left alone rather than tuned against hand-picked strings:
+
+    - Multi-word entity forms without a single-word marker are missed, e.g.
+      "CITY OF LEXINGTON", "HABITAT FOR HUMANITY".
+    - Punctuated abbreviations are missed because the tokenizer splits on any
+      non-alpha character, e.g. "ACME L.L.C." tokenizes to {"L", "L", "C"},
+      none of which is a whole-word match (and adding "C" as a token would
+      false-positive on countless initials, so it stays out).
+    - False positives happen when a person's surname is itself a company
+      token, e.g. "CHURCH, MARY" (a person surnamed Church) is flagged. This
+      is low-cost: the consuming engine still sees the raw ownerName and can
+      reason about it directly.
     """
     owner = _text(_raw(row).get("ownerName"))
     if not owner:

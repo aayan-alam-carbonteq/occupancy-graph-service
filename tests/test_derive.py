@@ -37,6 +37,33 @@ def test_company_from_owner_name_is_none_for_natural_persons(owner_name):
     assert derive.company_from_owner_name({"raw_data": {"ownerName": owner_name}}) is None
 
 
+def test_company_from_owner_name_detects_tr_abbreviation_for_trust():
+    """TR is the standard county-assessor abbreviation for TRUST and appears
+    throughout real property records — a genuine coverage gap fixed after an
+    earlier version's token set had a dead "L L C" entry (unreachable because
+    the tokenizer splits on non-alpha, so a multi-word entry can never match)
+    and no "TR" entry at all."""
+    owner_name = "JONES REVOCABLE TR"
+    assert derive.company_from_owner_name({"raw_data": {"ownerName": owner_name}}) == owner_name
+
+
+def test_known_false_positive_person_surnamed_church_is_flagged():
+    """Pinned deliberately: CHURCH is a company token, so a person surnamed
+    Church is misdetected as an entity owner. This is a known, accepted limit
+    of the heuristic (see company_from_owner_name's docstring) — the consuming
+    engine still sees the raw ownerName. If this ever starts returning None,
+    that must be a deliberate decision, not an accident."""
+    owner_name = "CHURCH, MARY"
+    assert derive.company_from_owner_name({"raw_data": {"ownerName": owner_name}}) == owner_name
+
+
+def test_company_tokens_are_all_single_alphabetic_words():
+    """The tokenizer splits ownerName on any non-alpha character, so a
+    multi-word or punctuated entry in _COMPANY_TOKENS would be unreachable
+    (this is exactly how the old "L L C" entry went dead)."""
+    assert all(t.isalpha() for t in derive._COMPANY_TOKENS)
+
+
 def test_house_number_parses_the_leading_number_from_free_text():
     assert derive.house_number({"address": "1104 Spring Run Rd"}) == "1104"
     assert derive.house_number({"address": "ESTHER ST"}) is None
