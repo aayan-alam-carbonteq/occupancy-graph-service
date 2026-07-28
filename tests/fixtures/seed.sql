@@ -102,10 +102,10 @@ INSERT INTO public.records_partitioned
   (record_id, source_file, imported_at, first_name, last_name, address, city, state, raw_data)
 VALUES
   (4002, 'property_owner_49/property_owner_49.csv', '2026-03-05', '', 'ACME',
-   '456 PINE ST', 'LEXINGTON', 'KY',
+   '123 MAIN ST', 'LEXINGTON', 'KY',
    '{"ownerName": "ACME HOLDINGS LLC", "ownerAddressLine1": "1 CORP PLZ",
      "ownerCity": "CHICAGO", "ownerState": "IL", "ownerZipCode": "60601",
-     "residential": "True", "condo": "False", "streetNumber": "456",
+     "residential": "True", "condo": "False", "streetNumber": "123",
      "zipCodePlusFour": "40505-2000", "fipsState": "21", "fipsCounty": "067",
      "ownerResCount": "0", "totalLienCount": "0"}'::jsonb);
 
