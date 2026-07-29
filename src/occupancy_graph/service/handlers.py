@@ -14,8 +14,12 @@ from occupancy_graph.service import records as records_mod
 from occupancy_graph.service.jsonio import jsonable
 from occupancy_graph.service.limits import PREFLIGHT_ROWS
 from occupancy_graph.service.pagination import Page, page_params, paginate
+from occupancy_graph.source import quality, search
 from occupancy_graph.source.bundle import AddressBundle
+from occupancy_graph.source.feeds import shapes_for_row
+from occupancy_graph.source.manifest import SHAPES
 from occupancy_graph.source.people import PERSON_ID_PREFIX, people_for_bundle
+from occupancy_graph.source.project import project_row
 from occupancy_graph.source.search import HAL_ID_PREFIX
 
 # The keys a person carries on the wire. `sources` is a set internally and
@@ -168,7 +172,7 @@ async def person_records(request: Request) -> JSONResponse:
     if person_id.startswith(PERSON_ID_PREFIX):
         return await _addr_person_records(request, person_id, page, shapes, unsupported)
     if person_id.startswith(HAL_ID_PREFIX):
-        return error(501, "hal: traversal not implemented")   # replaced in Task 13
+        return await _hal_person_records(request, person_id, page, shapes, unsupported)
     return _malformed_person_id(person_id)
 
 
@@ -224,6 +228,78 @@ async def _addr_person_records(
             },
             "records_by_source": blocks,
             "records_timed_out": False,
+            "unsupported_shapes": unsupported,
+        }
+    )
+
+
+def _by_record_id(row: dict[str, Any]) -> tuple[bool, Any]:
+    """Sort key mirroring bundle._stable_order: a NULL record_id sorts LAST
+    rather than raising on a None/int comparison."""
+    return (row.get("record_id") is None, row.get("record_id"))
+
+
+async def _hal_person_records(
+    request: Request,
+    person_id: str,
+    page: Page,
+    shapes: tuple[str, ...],
+    unsupported: list[str],
+) -> JSONResponse:
+    """Owner-elsewhere traversal: entity_links -> partner rows -> projections.
+
+    Rows reached this way carry no shape label -- the forward scan knew the
+    shape because it chose the predicate. shapes_for_row reverses the
+    source_file predicates, and one payday row legitimately yields BOTH `loan`
+    and `drive`, exactly as the address scan does.
+    """
+    pool = request.app.state.pool
+    hal_id = person_id[len(HAL_ID_PREFIX):]
+
+    person = await search.person_for_hal_id(pool, hal_id)
+    if person is None:
+        return error(404, f"unknown person id {person_id}")
+
+    links = await search.records_for_hal_id(pool, hal_id)
+    rows, timed_out = await search.rows_for_links(pool, links)
+
+    by_shape: dict[str, list[dict[str, Any]]] = {shape: [] for shape in shapes}
+    # rows_for_links groups by physical table and selects `WHERE record_id =
+    # ANY(...)` with no ORDER BY, so the database returns them in whatever
+    # order the plan emits. Ordered HERE for the same reason the address path
+    # orders in bundle._stable_order: records[0] must not move between two
+    # identical calls once a person has two rows of one shape.
+    for row in sorted(rows, key=_by_record_id):
+        for shape in shapes_for_row(row):
+            if shape not in by_shape:
+                continue
+            # The same fail-closed gate the address scan applies: a
+            # column-shifted property_owner row must never reach the model.
+            # It reads raw_data, so it runs BEFORE project_row.
+            if shape == "tax" and not quality.tax_row_is_usable(row):
+                continue
+            by_shape[shape].append(project_row(SHAPES[shape], row))
+
+    return ok(
+        {
+            "person": {
+                "id": person_id,
+                "firstname": person["canonical_first_name"],
+                "lastname": person["canonical_last_name"],
+                # The partner ER graph is 17.9% suspicious, peaks at confidence
+                # 40.50 and never applies its computed merges. These two fields
+                # are how the model discounts it, so they are never omitted.
+                "identity_confidence": person["identity_confidence"],
+                "is_suspicious": person["is_suspicious"],
+            },
+            "records_by_source": {
+                shape: records_mod.records_block(by_shape[shape], page, with_rowid=False)
+                for shape in shapes
+            },
+            # record_id is not indexed on the partner records tables. An empty
+            # result must never be read as "this person has no records" when it
+            # actually means "the lookup ran out of time".
+            "records_timed_out": timed_out,
             "unsupported_shapes": unsupported,
         }
     )
