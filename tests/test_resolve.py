@@ -39,9 +39,29 @@ def test_address_query_normalizes_and_extracts_the_prefix():
     query = AddressQuery.build("1104 Spring Run Road", "40514-1046")
     assert query.norm_address == "1104 SPRING RUN RD"
     assert query.zip5 == "40514"
-    assert query.like_prefix == "1104 Spring Run%"
+    assert query.like_prefix == "1104 Spring%"
 
 
 def test_address_query_without_a_house_number_falls_back_to_the_whole_string():
     query = AddressQuery.build("Esther St", "02920")
     assert query.like_prefix == "Esther St%"
+
+
+def test_address_query_prefix_excludes_the_unit_designator():
+    # A unit designator ("Apt 4") must never enter the prefix: a stored row
+    # may omit it, abbreviate it differently, or place it elsewhere, so
+    # including it risks silently losing rows rather than merely being less
+    # selective.
+    query = AddressQuery.build("123 Main St Apt 4", "40505")
+    assert query.like_prefix == "123 Main%"
+
+
+def test_address_query_recognizes_an_alphanumeric_house_number():
+    query = AddressQuery.build("12A Oak Ct", "40505")
+    assert query.like_prefix == "12A Oak%"
+
+
+async def test_scan_of_an_empty_address_returns_empty_without_querying(pool):
+    result = await scan_zip_sources(pool, AddressQuery.build("", "40505"))
+    assert all(rows == [] for rows in result.rows_by_shape.values())
+    assert result.city is None

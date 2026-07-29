@@ -36,22 +36,26 @@ class AddressQuery:
     def build(cls, address: str, zip_code: str | None) -> "AddressQuery":
         raw = (address or "").strip()
         normalized = normalize_address(raw)
-        # Prefix on house number + every token up to (but not including) the
-        # last one, which is treated as the street suffix: selective enough to
-        # filter a ZIP's worth of rows, loose enough to survive suffix spelling
-        # drift ("RD" vs "ROAD"), which the free-text column does not
-        # normalize. "1104 Spring Run Road" -> "1104 Spring Run" (drops
-        # "Road"). Tokenizing (rather than slicing the raw string) also
-        # collapses irregular internal whitespace instead of baking it into
-        # the LIKE pattern. With at most one token after the house number, or
-        # no leading house number at all, the whole raw string is used
-        # unmodified.
+        # Prefix on house number + first street token ONLY: selective enough
+        # to filter a ZIP's worth of rows, loose enough to survive suffix
+        # spelling drift ("RD" vs "ROAD"), missing suffixes, and unit
+        # designators, none of which the free-text column normalizes.
+        # "1104 Spring Run Road" -> "1104 Spring" (not "...Run" or "...Run
+        # Road" -- a longer prefix looks more selective but risks silently
+        # losing rows on any suffix/unit variation, which is worse than the
+        # extra heap-filter cost of a broader prefix). "123 Main St Apt 4" ->
+        # "123 Main" -- the unit designator ("Apt 4") must never enter the
+        # prefix, or it would fail to match a stored row that omits or
+        # abbreviates it differently. Tokenizing (rather than slicing the raw
+        # string) also collapses irregular internal whitespace instead of
+        # baking it into the LIKE pattern. A leading token that merely
+        # *starts* with a digit counts as a house number ("12A"), since
+        # alphanumeric house numbers are real. With no house number at all,
+        # the whole raw string is used unmodified.
         tokens = raw.split()
-        if tokens and tokens[0].isdigit():
-            house, rest = tokens[0], tokens[1:]
-            if len(rest) >= 2:
-                rest = rest[:-1]
-            prefix = " ".join([house, *rest]) if rest else house
+        if tokens and tokens[0][:1].isdigit():
+            house = tokens[0]
+            prefix = f"{house} {tokens[1]}" if len(tokens) > 1 else house
         else:
             prefix = raw
         return cls(
@@ -71,6 +75,12 @@ class ZipScanResult:
 
 async def scan_zip_sources(pool: PartnerPool, query: AddressQuery) -> ZipScanResult:
     result = ZipScanResult(rows_by_shape={shape: [] for shape in ZIP_SHAPES})
+    if not query.raw:
+        # An empty address has no prefix worth of its own: `like_prefix` would
+        # be a bare "%", which matches every row in the ZIP (~270k on the real
+        # corpus) truncated to MAX_ROWS_PER_SHAPE -- silently arbitrary rows
+        # presented as a match. Refuse to query at all instead.
+        return result
     for shape in ZIP_SHAPES:
         for table in FEEDS[shape].tables:
             rows = await _scan_one(pool, table, shape, query)
