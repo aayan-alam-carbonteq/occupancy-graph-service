@@ -117,7 +117,13 @@ async def scan_zip_sources(pool: PartnerPool, query: AddressQuery) -> ZipScanRes
     return result
 
 
-def _decode(row: dict) -> dict:
+def decode_raw_data(row: dict) -> dict:
+    """asyncpg hands jsonb back as a str on some connections and a dict on
+    others. Normalize to a dict, and to {} on malformed JSON -- a projection
+    crash would take down an entire investigation.
+
+    Public because search.py fetches rows by record_id rather than through
+    _scan_one, and both paths must deliver raw_data in the same shape."""
     value = row.get("raw_data")
     if isinstance(value, str):
         try:
@@ -141,7 +147,7 @@ async def _scan_one(
     """
     async with pool.acquire() as conn:
         rows = await conn.fetch(sql, query.zip5, query.like_prefix, *patterns)
-    return [_decode(dict(row)) for row in rows]
+    return [decode_raw_data(dict(row)) for row in rows]
 
 
 @dataclass
@@ -208,7 +214,7 @@ async def scan_tax_source(
     kept: list[dict] = []
     dropped = 0
     for row in rows:
-        decoded = _decode(dict(row))
+        decoded = decode_raw_data(dict(row))
         if quality.tax_row_is_usable(decoded):
             kept.append(decoded)
         else:

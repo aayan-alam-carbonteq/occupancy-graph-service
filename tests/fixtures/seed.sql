@@ -124,13 +124,21 @@ VALUES
      "cityUSPS": "44 PENGROVE ST"}'::jsonb);
 
 -- silver: Jane Doe resolves to one entity; the trace + payday rows link to her.
+-- HAL0003 is a SECOND non-merged DOE at a different address. It exists so name
+-- search has more surname matches than a one-row page can hold: without it,
+-- total and len(page) are both 1 and a hardcoded len(rows) would pass for a real
+-- count(*) OVER (). HAL0004 is a MERGED DOE -- the graph records its merges but
+-- never applies them, so both sides stay in entity_master and only `is_merged`
+-- keeps a superseded duplicate out of the results.
 INSERT INTO silver.entity_master
   (hal_id, canonical_first_name, canonical_last_name, canonical_address_line1,
    canonical_city, canonical_state, canonical_zip, record_count,
-   identity_confidence, is_suspicious, is_merged)
+   identity_confidence, is_suspicious, is_merged, merged_into_hal_id)
 VALUES
-  ('HAL0001', 'JANE', 'DOE', '123 MAIN ST', 'LEXINGTON', 'KY', '40505', 3, 40.50, false, false),
-  ('HAL0002', 'JOHN', 'SMITH', '456 PINE ST', 'LEXINGTON', 'KY', '40505', 1, 88.00, true,  false);
+  ('HAL0001', 'JANE', 'DOE', '123 MAIN ST', 'LEXINGTON', 'KY', '40505', 3, 40.50, false, false, NULL),
+  ('HAL0002', 'JOHN', 'SMITH', '456 PINE ST', 'LEXINGTON', 'KY', '40505', 1, 88.00, true,  false, NULL),
+  ('HAL0003', 'RICHARD', 'DOE', '88 ELM ST', 'LEXINGTON', 'KY', '40507', 2, 61.25, false, false, NULL),
+  ('HAL0004', 'MARY', 'DOE', '123 MAIN ST', 'LEXINGTON', 'KY', '40505', 1, 33.00, false, true, 'HAL0001');
 
 INSERT INTO silver.entity_links (hal_id, source_table, record_id, match_type, confidence)
 VALUES
