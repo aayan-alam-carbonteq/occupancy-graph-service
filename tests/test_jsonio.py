@@ -43,6 +43,23 @@ def test_containers_are_converted_recursively():
     assert jsonable([Decimal("1.5"), {"d": date(2026, 1, 1)}]) == [1.5, {"d": "2026-01-01"}]
 
 
+def test_no_decimal_escapes_as_a_value_json_cannot_emit():
+    """Postgres numeric admits NaN and +/-Infinity, and this module's whole job
+    is that nothing reaches json.dumps that it cannot emit strictly.
+
+    Two distinct failure modes, hence two guards: sNaN is non-finite and raises
+    outright on float() conversion, while 1E999999 is a perfectly FINITE Decimal
+    that overflows to inf only once converted. Checking is_finite() alone would
+    miss the second; converting first would raise on the first.
+    """
+    assert jsonable(Decimal("NaN")) is None
+    assert jsonable(Decimal("sNaN")) is None
+    assert jsonable(Decimal("Infinity")) is None
+    assert jsonable(Decimal("-Infinity")) is None
+    assert jsonable(Decimal("1E999999")) is None
+    assert json.dumps(jsonable({"c": Decimal("sNaN")})) == '{"c": null}'
+
+
 def test_non_finite_floats_become_null_and_everything_dumps():
     assert jsonable(float("nan")) is None
     assert jsonable(float("inf")) is None

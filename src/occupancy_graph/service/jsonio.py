@@ -21,6 +21,12 @@ def jsonable(value: Any) -> Any:
         # json.dumps emits bare NaN/Infinity, which strict JSON parsers reject.
         return value if math.isfinite(value) else None
     if isinstance(value, Decimal):
+        # Two guards, because they catch different things. is_finite() rejects
+        # NaN/sNaN/Infinity BEFORE conversion -- float(Decimal("sNaN")) raises
+        # rather than returning nan. The second catches the opposite case: a
+        # finite Decimal too large for a float (1E999999) overflows to inf.
+        if not value.is_finite():
+            return None
         number = float(value)
         return number if math.isfinite(number) else None
     if isinstance(value, (datetime, date, time)):

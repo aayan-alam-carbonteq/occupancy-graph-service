@@ -49,6 +49,25 @@ def test_paginate_last_page_has_no_more():
     assert block == {"total_count": 10, "has_more": False, "records": ["row9"]}
 
 
+def test_has_more_is_computed_from_the_window_not_from_offset_plus_limit():
+    """Pins has_more either side of the boundary at a non-degenerate offset:
+    rows 5,6,7 served with 8,9 still to come, then rows 7,8,9 exhausting the
+    list. Every other case in this file sits at offset 0, the final row, or
+    past the end.
+
+    One caveat worth recording so nobody re-derives it: `page.offset +
+    page.limit < total` is NOT a counterexample. It agrees with the shipped
+    formula on every non-negative offset/limit pair, because a partial window
+    forces both sides False. The off-by-one these cases actually pin is the
+    comparison itself -- `<=` for `<` claims has_more on the window that
+    exactly exhausts the list.
+    """
+    # Rows 5,6,7 served; 8 and 9 remain.
+    assert paginate(ITEMS, Page(limit=3, offset=5))["has_more"] is True
+    # Rows 7,8,9 exhaust the list -- the neighbouring window, one step on.
+    assert paginate(ITEMS, Page(limit=3, offset=7))["has_more"] is False
+
+
 def test_paginate_uses_the_requested_collection_key_and_survives_a_past_end_offset():
     block = paginate(ITEMS, Page(limit=5, offset=50), key="people")
     assert block == {"total_count": 10, "has_more": False, "people": []}
