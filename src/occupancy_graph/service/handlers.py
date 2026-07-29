@@ -13,8 +13,16 @@ from starlette.responses import JSONResponse
 from occupancy_graph.service import records as records_mod
 from occupancy_graph.service.jsonio import jsonable
 from occupancy_graph.service.limits import PREFLIGHT_ROWS
-from occupancy_graph.service.pagination import Page, page_params
+from occupancy_graph.service.pagination import Page, page_params, paginate
 from occupancy_graph.source.bundle import AddressBundle
+from occupancy_graph.source.people import people_for_bundle
+
+# The keys a person carries on the wire. `sources` is a set internally and
+# `rows` is the internal row list -- neither may leak in that form.
+_PERSON_KEYS = (
+    "id", "firstname", "middlename", "lastname", "full_name",
+    "norm_name_key", "sources", "primary_address_id",
+)
 
 
 def ok(payload: dict[str, Any]) -> JSONResponse:
@@ -112,3 +120,22 @@ async def address_records(request: Request) -> JSONResponse:
             "unsupported_shapes": unsupported,
         }
     )
+
+
+def _public_person(person: dict[str, Any]) -> dict[str, Any]:
+    out = {key: person.get(key) for key in _PERSON_KEYS}
+    out["sources"] = sorted(person.get("sources") or ())
+    return out
+
+
+async def address_people(request: Request) -> JSONResponse:
+    address_id = int(request.path_params["address_id"])
+    bundle = await request.app.state.cache.get(address_id)
+    if bundle is None:
+        return error(404, f"unknown address_id {address_id}")
+    try:
+        page = page_params(request.query_params)
+    except ValueError as exc:
+        return error(400, str(exc))
+    people = [_public_person(person) for person in people_for_bundle(bundle)]
+    return ok(paginate(people, page, key="people"))
