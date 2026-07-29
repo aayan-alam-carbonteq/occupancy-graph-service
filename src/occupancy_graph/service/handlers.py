@@ -347,3 +347,47 @@ async def people_search(request: Request) -> JSONResponse:
             "results": results,
         }
     )
+
+
+async def source_record(request: Request) -> JSONResponse:
+    shape = str(request.path_params["shape"])
+    rowid = int(request.path_params["rowid"])
+
+    raw_address_id = request.query_params.get("address_id")
+    if not raw_address_id:
+        return error(
+            400,
+            "address_id is required: rowid is a position within one address's "
+            "rows for this shape, so it cannot be resolved without the address",
+        )
+    try:
+        address_id = int(raw_address_id)
+    except ValueError:
+        return error(400, f"address_id must be an integer, got {raw_address_id!r}")
+
+    if shape not in SHAPES:
+        return error(404, f"unknown shape {shape!r}; this corpus serves {sorted(SHAPES)}")
+
+    bundle = await request.app.state.cache.get(address_id)
+    if bundle is None:
+        return error(404, f"unknown address_id {address_id}")
+
+    rows = bundle.rows_by_shape.get(shape, [])
+    if not 0 <= rowid < len(rows):
+        return error(404, f"no {shape} row at rowid {rowid} for address {address_id}")
+
+    row = rows[rowid]
+    return ok(
+        {
+            "source": shape,
+            # The partner corpus is one physical table; `table` names the SHAPE,
+            # which is what provenance means to the consumer.
+            "table": shape,
+            "rowid": rowid,
+            # Every id-linked shape derives its id from record_id, which is
+            # unique across the corpus.
+            "record_id": row.get("id") or row.get(f"{shape}_id"),
+            "summary": records_mod.summarize(shape, row),
+            "data": dict(row),
+        }
+    )
