@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
+
+import asyncpg
 import pytest
 
 from occupancy_graph.source import resolve as resolve_module
@@ -171,16 +174,135 @@ async def test_tax_scan_without_city_or_state_returns_empty_not_an_error(pool):
 
 
 async def test_tax_scan_reports_a_timeout_instead_of_raising(fixture_db):
-    pool = await PartnerPool.create(fixture_db, statement_timeout_ms=1)
+    """SMOKE TEST -- NOT the timeout guarantee. Read this before trusting it.
+
+    Its value is that it is the only test driving a genuine Postgres
+    QueryCanceledError through asyncpg on this path rather than a hand-rolled
+    double. But it cannot be made deterministic, so it asserts under a guard --
+    exactly like its sibling in test_search.py.
+
+    WHY IT IS GUARDED. This test used to hard-assert `timed_out is True` at
+    statement_timeout_ms=1 and failed ~1 run in 10 with
+
+        InternalClientError: cannot switch to state 12; another operation (2)
+        is in progress
+
+    At 1 ms the cancellation lands between asyncpg's Parse/Describe and
+    Bind/Execute, before the protocol has drained the ErrorResponse, and the
+    error raises straight out of conn.fetch. That is a test artifact, not a
+    production risk: real PARTNER_STATEMENT_TIMEOUT_MS values are seconds, so
+    cancellation lands long after Parse/Describe. It must NOT be "fixed" by
+    catching InternalClientError in resolve.py -- that would mask genuine
+    protocol errors in production (pinned below by
+    test_a_protocol_error_is_not_swallowed_as_a_timeout).
+
+    Raising the timeout does not make it deterministic either, it only moves
+    which end it fails from. Measured on the dev box, fresh pool per run:
+
+        1 ms   n=450   8.0% raised InternalClientError (the old flake)
+        2 ms   n=150   150 timed out, 0 raced
+        3 ms   n=150   150 timed out, 0 raced
+        4 ms   n=150   150 timed out, 0 raced
+        5 ms   n=300   300 timed out, 0 raced
+        6 ms   n=40     40 timed out, 0 raced
+        8 ms   n=40     25 timed out, 15 COMPLETED
+       10 ms   n=40      5 timed out, 35 COMPLETED
+       15 ms+  n=40      0 timed out, 40 COMPLETED
+
+    The usable window is ~2-6 ms and it is bounded on both sides by timing: the
+    protocol race below, and the query simply finishing above (the scan itself
+    measures min 8.96 ms / median 10.5 ms here over 40 runs). The upper bound is
+    nothing but machine speed against a ~20-row fixture, so on a faster box the
+    window narrows or closes and a hard assert would fail the other way. 5 ms is
+    chosen as the midpoint -- clear of the race, which is what the guard cannot
+    absorb, since a raised InternalClientError fails the test guard or no guard.
+
+    The deterministic coverage of the ([], True) contract lives in
+    test_a_cancelled_tax_scan_degrades_to_empty_rather_than_raising.
+    """
+    pool = await PartnerPool.create(fixture_db, statement_timeout_ms=5)
     try:
         query = AddressQuery.build("123 Main St", "40505")
         result = await scan_tax_source(pool, query, city="LEXINGTON", state="KY")
     finally:
         await pool.close()
-    assert result.timed_out is True
-    assert result.rows == []
+    assert isinstance(result.timed_out, bool)
+    # Recorded on BOTH branches, so these are unconditional.
     assert result.queried_city == "LEXINGTON"
     assert result.queried_state == "KY"
+    if result.timed_out:
+        assert result.rows == []
+
+
+# --- The tax-scan degradation path, made deterministic ----------------------
+#
+# The smoke test above races the database for its cancellation and so may assert
+# almost nothing. The two tests below inject the cancellation instead. An empty
+# result mistaken for "this property has no assessor record" is a failure mode
+# this repo has already been bitten by twice (TaxScanResult.queried_city,
+# tax_timed_out), which is why the degraded shape is pinned rather than assumed.
+
+
+class _ScriptedPool:
+    """Stands in for PartnerPool. `scan_tax_source` touches exactly two things
+    -- `pool.acquire()` as an async context manager and `conn.fetch(sql, *args)`
+    -- so this is the whole surface, not a re-implementation of it."""
+
+    def __init__(self, script):
+        self._script = list(script)
+        self.calls: list[tuple[str, tuple]] = []
+
+    @asynccontextmanager
+    async def acquire(self):
+        yield self
+
+    async def fetch(self, sql, *args):
+        self.calls.append((sql, args))
+        step = self._script.pop(0)
+        if isinstance(step, BaseException):
+            raise step
+        return step
+
+
+async def test_a_cancelled_tax_scan_degrades_to_empty_rather_than_raising():
+    """The ([], True) contract, plus the parameters the scan actually used.
+
+    queried_city/queried_state must survive the degraded path and arrive
+    upper-cased, exactly as on the success path: a caller distinguishing "no
+    assessor record" from "phase 1 voted the wrong city" needs them precisely
+    when the scan failed, and a None there would silently read as "no city was
+    searched" instead of "the search for LEXINGTON was cut short"."""
+    pool = _ScriptedPool([
+        asyncpg.QueryCanceledError("canceling statement due to statement timeout")
+    ])
+    result = await scan_tax_source(
+        pool, AddressQuery.build("123 Main St", "40505"), city="Lexington", state="ky"
+    )
+    assert result.timed_out is True
+    assert result.rows == []
+    assert result.dropped == 0
+    assert result.queried_city == "LEXINGTON"
+    assert result.queried_state == "KY"
+    assert len(pool.calls) == 1
+
+
+async def test_a_protocol_error_is_not_swallowed_as_a_timeout():
+    """The `except` in scan_tax_source is narrow ON PURPOSE.
+
+    The flake documented on the smoke test above surfaced as an asyncpg
+    InternalClientError, and the cheap way to silence it would have been to
+    widen this except clause. That would convert every genuine protocol fault in
+    production -- a desynchronized connection, a driver bug -- into a silent
+    "this property has no tax record", which is the exact failure this module
+    already carries two scars from. It must propagate."""
+    boom = asyncpg.exceptions._base.InternalClientError(
+        "cannot switch to state 12; another operation (2) is in progress"
+    )
+    pool = _ScriptedPool([boom])
+    with pytest.raises(asyncpg.exceptions._base.InternalClientError):
+        await scan_tax_source(
+            pool, AddressQuery.build("123 Main St", "40505"), city="LEXINGTON", state="KY"
+        )
 
 
 async def test_tax_scan_empty_result_is_ambiguous_between_no_record_and_wrong_city(pool):
