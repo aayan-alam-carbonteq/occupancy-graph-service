@@ -5,8 +5,12 @@ import subprocess
 from pathlib import Path
 
 import asyncpg
+import httpx
 import pytest
 import pytest_asyncio
+
+from occupancy_graph.source.bundle import BundleCache
+from occupancy_graph.source.pool import PartnerPool
 
 FIXTURE_DIR = Path(__file__).parent / "fixtures"
 COMPOSE = Path(__file__).parent / "docker-compose.fixture.yml"
@@ -46,3 +50,24 @@ async def fixture_pool(fixture_db: str):
     pool = await asyncpg.create_pool(fixture_db, min_size=1, max_size=4, init=_setup)
     yield pool
     await pool.close()
+
+
+@pytest_asyncio.fixture(loop_scope="session")
+async def service_pool(fixture_db: str):
+    """A PartnerPool over the fixture, shaped exactly like the production one."""
+    pool = await PartnerPool.create(fixture_db, statement_timeout_ms=10_000)
+    yield pool
+    await pool.close()
+
+
+@pytest_asyncio.fixture(loop_scope="session")
+async def client(service_pool):
+    """The ASGI app driven in-process. httpx.ASGITransport does NOT run the
+    lifespan, which is exactly what we want: the pool and cache are injected,
+    so no test needs PARTNER_DSN."""
+    from occupancy_graph.service.app import create_app
+
+    app = create_app(pool=service_pool, cache=BundleCache(service_pool))
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://graph.test") as http:
+        yield http
