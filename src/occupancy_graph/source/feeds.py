@@ -6,7 +6,12 @@ applied as heap filters on top of an index-qualified predicate (`zip`, or
 """
 from __future__ import annotations
 
+import re
+from collections.abc import Mapping
 from dataclasses import dataclass
+from typing import Any
+
+from occupancy_graph.source.manifest import SHAPES
 
 
 @dataclass(frozen=True)
@@ -56,3 +61,63 @@ def feed_clause(shape: str, start_index: int) -> tuple[str, list[str]]:
     placeholders = [f"source_file LIKE ${start_index + i}" for i in range(len(spec.patterns))]
     clause = "(" + " OR ".join(placeholders) + ")" + spec.extra_sql
     return clause, list(spec.patterns)
+
+
+def _like_to_regex(pattern: str) -> re.Pattern[str]:
+    """Compile one SQL LIKE pattern. `%` is any run, `_` is exactly one char;
+    every other character is literal, so regex metacharacters in feed names
+    ("2026.1-USCRM/%") are escaped rather than interpreted."""
+    parts = []
+    for char in pattern:
+        if char == "%":
+            parts.append(".*")
+        elif char == "_":
+            parts.append(".")
+        else:
+            parts.append(re.escape(char))
+    return re.compile("^" + "".join(parts) + "$")
+
+
+# Reverse lookup table, in manifest order -- NOT FEEDS order, which differs
+# (utility, trace, base, loan, drive, auto, tax) and would emit ("loan", "drive").
+# Keying off SHAPES rather than restating the order means a shape added to the
+# manifest but not to FEEDS raises KeyError HERE, at import, instead of being
+# silently dropped from every reverse lookup. test_manifest_and_feeds_cover_
+# exactly_the_same_shapes pins the two key sets together for the other direction.
+#
+# LIKE is case-sensitive (feed_clause emits LIKE, not ILIKE), so no re.I here.
+_REVERSE_FEEDS: tuple[tuple[str, tuple[re.Pattern[str], ...]], ...] = tuple(
+    (shape, tuple(_like_to_regex(pattern) for pattern in FEEDS[shape].patterns))
+    for shape in SHAPES
+)
+
+
+def shapes_for_row(row: Mapping[str, Any]) -> tuple[str, ...]:
+    """Every shape a fetched partner row belongs to, in manifest order.
+
+    The forward scan knows the shape because it chose the predicate. Rows
+    reached by record_id (the `hal:` traversal) do not, so the source_file
+    predicates run backwards here.
+
+    A row can be TWO shapes: `drive` is the same physical payday row as `loan`,
+    distinguished only by `dl_number IS NOT NULL` -- FeedSpec.extra_sql in the
+    forward direction, an explicit check here.
+
+    CALLER CONTRACT: `dl_number` must be in the projection. A row fetched with a
+    column list that omits it is indistinguishable from one where the licence is
+    NULL, and will come back `loan` without `drive`. Mapping.get cannot tell
+    "not selected" from "selected and null", so this is a constraint on the
+    SELECT, not something checkable here.
+    """
+    source_file = row.get("source_file")
+    if not source_file:
+        return ()
+    text = str(source_file)
+    matched = []
+    for shape, patterns in _REVERSE_FEEDS:
+        if not any(pattern.match(text) for pattern in patterns):
+            continue
+        if shape == "drive" and row.get("dl_number") in (None, ""):
+            continue
+        matched.append(shape)
+    return tuple(matched)
