@@ -349,3 +349,29 @@ def parse(query: str) -> str:
             raise SqlRefused("parse", f"function {folded} is not permitted")
 
     return text
+
+
+def wrap_with_limit(query: str, *, cap: int) -> str:
+    """Stage 2: bound the result set.
+
+    The query is WRAPPED in a subquery rather than having its LIMIT rewritten.
+    Rewriting requires understanding the query -- which LIMIT is the outer one,
+    whether it is inside a CTE or a subquery -- and the entire premise of stage
+    1 is that we never have to. Wrapping caps unconditionally: a supplied
+    LIMIT larger than the cap is overridden by the outer one, and a smaller one
+    still wins because Postgres pushes the outer limit down.
+
+    Newlines around the body are load-bearing: a trailing `-- comment` would
+    otherwise swallow the closing parenthesis. Verified against the fixture in
+    test_a_trailing_comment_cannot_evade_the_row_cap_in_practice -- a `--` ends
+    at the newline, so `) AS _hatch` survives on its own line.
+
+    int(cap) is not cosmetic -- it is the only reason no caller-supplied text
+    can reach a SQL position here. It rejects "50; DROP TABLE t" (ValueError)
+    and None (TypeError) rather than interpolating them. It also accepts bool,
+    because bool IS an int subclass in Python: cap=True yields LIMIT 1. That is
+    a caller bug rather than a hazard -- it errs toward FEWER rows, and every
+    coercion int() performs (float truncation, bool) rounds toward a smaller
+    cap, never a larger one.
+    """
+    return f"SELECT * FROM (\n{query}\n) AS _hatch\nLIMIT {int(cap)}"

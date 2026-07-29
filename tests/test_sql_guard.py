@@ -462,3 +462,129 @@ def test_placeholder_text_never_reaches_the_returned_query():
     a query's literals and comments must survive it byte for byte."""
     query = "SELECT 'ACME; DROP' AS employer /* keep me */ FROM records_legacy"
     assert parse(query) == query
+
+
+# --- Stage 2: the row cap. Wrapping rather than rewriting: a textual LIMIT
+# --- rewrite has to understand the query, and the whole point of stage 1 is
+# --- that we do not have to.
+
+from occupancy_graph.service.sql_guard import wrap_with_limit  # noqa: E402
+
+
+def test_a_query_without_a_limit_gets_one():
+    assert wrap_with_limit("SELECT 1", cap=50) == (
+        "SELECT * FROM (\nSELECT 1\n) AS _hatch\nLIMIT 50"
+    )
+
+
+def test_a_supplied_limit_is_capped_by_the_outer_one():
+    wrapped = wrap_with_limit("SELECT 1 LIMIT 100000", cap=50)
+    assert wrapped.endswith("LIMIT 50")
+    assert "LIMIT 100000" in wrapped
+
+
+def test_a_trailing_line_comment_cannot_eat_the_closing_paren():
+    wrapped = wrap_with_limit("SELECT 1 -- note", cap=50)
+    assert "\n) AS _hatch" in wrapped
+    assert wrapped.splitlines()[-2] == ") AS _hatch"
+
+
+def test_the_cap_is_coerced_to_an_int_so_no_text_reaches_the_sql():
+    assert wrap_with_limit("SELECT 1", cap=True).endswith("LIMIT 1")
+    with pytest.raises((ValueError, TypeError)):
+        wrap_with_limit("SELECT 1", cap="50; DROP TABLE t")
+
+
+def test_a_cte_survives_the_wrap():
+    wrapped = wrap_with_limit("WITH z AS (SELECT 1 AS n) SELECT n FROM z", cap=10)
+    assert wrapped.startswith("SELECT * FROM (\nWITH z AS")
+
+
+async def test_the_wrapped_form_actually_runs(fixture_pool):
+    wrapped = wrap_with_limit("SELECT record_id FROM public.records_legacy", cap=2)
+    async with fixture_pool.acquire() as conn:
+        rows = await conn.fetch(wrapped)
+    assert len(rows) == 2
+
+
+# --- Check D/F: the stage-1 -> stage-2 handoff, proven against the fixture ---
+
+
+def test_the_stage_one_output_is_what_stage_two_wraps():
+    """parse() feeds wrap_with_limit directly, so the handoff is pinned on the
+    exact strings rather than on each stage in isolation. `"SELECT 1; -- done"`
+    is the input that used to arrive at stage 2 with a live ';' still in it."""
+    assert wrap_with_limit(parse("SELECT 1; -- done"), cap=2) == (
+        "SELECT * FROM (\nSELECT 1\n) AS _hatch\nLIMIT 2"
+    )
+    assert wrap_with_limit(parse("SELECT * FROM t --"), cap=2) == (
+        "SELECT * FROM (\nSELECT * FROM t --\n) AS _hatch\nLIMIT 2"
+    )
+
+
+async def test_a_trailing_comment_cannot_evade_the_row_cap_in_practice(fixture_pool):
+    """The plan CLAIMS the newlines make a trailing comment safe. This confirms
+    it against a real server rather than trusting it: records_legacy holds more
+    rows than the cap, so a swallowed `) AS _hatch\\nLIMIT n` would show up as
+    more rows coming back, not as an error."""
+    async with fixture_pool.acquire() as conn:
+        total = await conn.fetchval("SELECT count(*) FROM public.records_legacy")
+        assert total > 2, "fixture must hold more rows than the cap to prove anything"
+        for query in (
+            "SELECT * FROM public.records_legacy --",
+            "SELECT * FROM public.records_legacy /* c */",
+            "SELECT * FROM public.records_legacy --x\r",
+            "SELECT * FROM public.records_legacy LIMIT 999",
+        ):
+            wrapped = wrap_with_limit(parse(query), cap=2)
+            assert len(await conn.fetch(wrapped)) == 2, query
+
+
+async def test_breaking_out_of_the_subquery_parenthesis_cannot_evade_the_cap(fixture_pool):
+    """The attack the wrap design actually invites: close the paren early, then
+    absorb the trailing `) AS _hatch LIMIT n`. Absorbing it needs a comment or
+    literal that never closes -- which is exactly what stage 1 refuses. So the
+    two stages interlock; neither would be sufficient alone."""
+    for query in (
+        "SELECT * FROM public.records_legacy) AS a LIMIT 999 /*",
+        "SELECT * FROM public.records_legacy) AS a LIMIT 999 '",
+        "SELECT * FROM public.records_legacy) AS a LIMIT 999 $q$",
+    ):
+        assert "unterminated" in refuse(query).reason
+
+    # These get past stage 1 (nothing is unterminated) but cannot execute: the
+    # tail is a stray paren, not extra rows.
+    async with fixture_pool.acquire() as conn:
+        for query in (
+            "SELECT * FROM public.records_legacy) AS a LIMIT 999 --",
+            "SELECT * FROM public.records_legacy) AS a LIMIT 999 /* */",
+        ):
+            wrapped = wrap_with_limit(parse(query), cap=2)
+            with pytest.raises(asyncpg.exceptions.PostgresSyntaxError):
+                await conn.fetch(wrapped)
+
+
+def test_every_cap_coercion_errs_toward_fewer_rows():
+    """int() is the only reason no caller text reaches a SQL position, and every
+    coercion it performs rounds the cap DOWN, never up."""
+    assert wrap_with_limit("SELECT 1", cap=50.9).endswith("LIMIT 50")
+    assert wrap_with_limit("SELECT 1", cap=True).endswith("LIMIT 1")
+    assert wrap_with_limit("SELECT 1", cap=False).endswith("LIMIT 0")
+    assert wrap_with_limit("SELECT 1", cap="50").endswith("LIMIT 50")
+    for bad in ("50; DROP TABLE t", None, float("inf"), float("nan"), "1e3"):
+        with pytest.raises((ValueError, TypeError, OverflowError)):
+            wrap_with_limit("SELECT 1", cap=bad)
+
+
+async def test_a_non_positive_cap_returns_no_rows_or_errors_but_never_all_of_them(
+    fixture_pool,
+):
+    """A negative cap is a caller bug. It must not degrade to "unbounded"."""
+    async with fixture_pool.acquire() as conn:
+        assert await conn.fetch(
+            wrap_with_limit("SELECT * FROM public.records_legacy", cap=0)
+        ) == []
+        with pytest.raises(asyncpg.PostgresError):
+            await conn.fetch(
+                wrap_with_limit("SELECT * FROM public.records_legacy", cap=-1)
+            )
