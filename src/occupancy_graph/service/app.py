@@ -50,6 +50,7 @@ def create_app(*, pool: PartnerPool | None = None, cache: BundleCache | None = N
 
     routes = [
         Route("/healthz", handlers.healthz, methods=["GET"]),
+        Route("/v1/resolve", handlers.resolve_address, methods=["POST"]),
     ]
     app = Starlette(
         routes=routes,
