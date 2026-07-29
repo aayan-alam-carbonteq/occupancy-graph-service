@@ -14,6 +14,7 @@ import asyncpg
 import pytest
 import pytest_asyncio
 
+from occupancy_graph.source import pool as pool_module
 from occupancy_graph.source.pool import PartnerPool
 
 SCRATCH_TABLE = "pool_test_scratch"
@@ -177,3 +178,68 @@ async def test_from_env_reads_overrides_from_environment(fixture_db, monkeypatch
         assert pool.pool.get_max_size() == 3
     finally:
         await pool.close()
+
+
+# --- Review fix 1: reject non-positive statement_timeout_ms (0 == UNLIMITED) ---
+
+
+async def test_create_rejects_zero_statement_timeout(fixture_db):
+    with pytest.raises(ValueError, match="UNLIMITED"):
+        await PartnerPool.create(fixture_db, statement_timeout_ms=0)
+
+
+async def test_create_rejects_negative_statement_timeout(fixture_db):
+    with pytest.raises(ValueError, match="UNLIMITED"):
+        await PartnerPool.create(fixture_db, statement_timeout_ms=-1)
+
+
+async def test_from_env_rejects_zero_statement_timeout_before_connecting(monkeypatch):
+    # DSN is deliberately meaningless: if the validation didn't run before
+    # asyncpg.create_pool, this would fail on connection instead, masking the
+    # real bug. Patching create_pool to blow up makes that failure mode loud.
+    monkeypatch.setenv("PARTNER_DSN", "postgresql://irrelevant/irrelevant")
+    monkeypatch.setenv("PARTNER_STATEMENT_TIMEOUT_MS", "0")
+
+    async def _must_not_be_called(*args, **kwargs):
+        raise AssertionError("asyncpg.create_pool must not be called for statement_timeout_ms=0")
+
+    monkeypatch.setattr(pool_module.asyncpg, "create_pool", _must_not_be_called)
+
+    with pytest.raises(ValueError, match="UNLIMITED"):
+        await PartnerPool.from_env()
+
+
+async def test_from_env_rejects_malformed_pool_max(fixture_db, monkeypatch):
+    monkeypatch.setenv("PARTNER_DSN", fixture_db)
+    monkeypatch.setenv("PARTNER_POOL_MAX", "abc")
+
+    with pytest.raises(ValueError, match="PARTNER_POOL_MAX"):
+        await PartnerPool.from_env()
+
+
+# --- Review fix 2: pin the scope of the read-only guarantee ---
+
+
+async def test_read_only_is_a_session_default_not_a_boundary(fixture_db, scratch_table):
+    """Known limitation, pinned so it can't silently regress into a false
+    sense of safety. `default_transaction_read_only` is a session DEFAULT,
+    not an enforced boundary: raw `BEGIN READ WRITE` overrides it and the
+    write succeeds. If this ever stops being true, we want to notice --
+    idiomatic asyncpg usage (e.g. conn.transaction(readonly=False)) does NOT
+    defeat the default, only raw SQL text like this does."""
+    pool = await PartnerPool.create(fixture_db, statement_timeout_ms=5000)
+    try:
+        async with pool.acquire() as conn:
+            await conn.execute("BEGIN READ WRITE")
+            try:
+                await conn.execute(
+                    f"INSERT INTO {scratch_table} (id, val) VALUES (99, 'defeats-default')"
+                )
+            except Exception:
+                await conn.execute("ROLLBACK")
+                raise
+            await conn.execute("COMMIT")
+            value = await conn.fetchval(f"SELECT val FROM {scratch_table} WHERE id = 99")
+    finally:
+        await pool.close()
+    assert value == "defeats-default"
