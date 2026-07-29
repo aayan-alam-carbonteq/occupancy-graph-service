@@ -13,6 +13,7 @@ dependencies = [
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=1.0",
+    "pytest-timeout>=2.4",
     "httpx>=0.28",
 ]
 
@@ -32,6 +33,18 @@ asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "session"
 asyncio_default_test_loop_scope = "session"
 markers = ["live: hits the real partner DB; requires PARTNER_DSN and network"]
+# A hang that produces NO output is the worst CI failure mode there is: two
+# separate sessions stalled for 10 and 15 minutes with a blank terminal before
+# being killed, and neither left a traceback to work from. This converts that
+# into a loud, located failure.
+#
+# The ceiling applies to EACH phase (setup, call, teardown) of EACH test, not to
+# the session. Measured slowest phase: 6.3s -- the session-scoped fixture_db
+# setup (`docker compose up --wait` + psql load of schema.sql/seed.sql). Every
+# other phase in the suite is under 0.8s and the whole run is ~19s. 120s is ~19x
+# the slowest real phase, which leaves room for a cold CI runner that still has
+# to pull the postgres image, while capping a wedged run at two minutes.
+timeout = 120
 filterwarnings = [
     "error:coroutine .* was never awaited:RuntimeWarning",
     "error::pytest.PytestUnraisableExceptionWarning",

@@ -9,6 +9,7 @@ every pooled connection, not just the first one created.
 from __future__ import annotations
 
 import asyncio
+import logging
 
 import asyncpg
 import pytest
@@ -243,3 +244,111 @@ async def test_read_only_is_a_session_default_not_a_boundary(fixture_db, scratch
     finally:
         await pool.close()
     assert value == "defeats-default"
+
+
+# --- Review fix 3: close() must be bounded -----------------------------------
+#
+# asyncpg.Pool.close() waits indefinitely for connections to release and has no
+# timeout parameter. A connection left mid-cancellation by a statement timeout
+# never releases, so the bare `await self.pool.close()` this replaced could stall
+# forever: a test session that produces NO output at all (observed twice, ~1 run
+# in 10, 10 and 15 minutes before being killed), and in production a container
+# that never exits and has to be SIGKILLed by its orchestrator.
+#
+# The fixture below is a pool whose close() genuinely never completes, which is
+# the only way to exercise the fallback deterministically -- forcing a real
+# asyncpg connection to wedge is exactly the race we cannot reproduce on demand.
+
+
+class _WedgedPool:
+    """An asyncpg.Pool stand-in whose close() never returns.
+
+    Deliberately NOT a Mock: the point is a close() that really never completes,
+    so that deleting the timeout in PartnerPool.close makes the test hang or
+    fail rather than pass.
+    """
+
+    def __init__(self) -> None:
+        self.close_entered = False
+        self.close_cancelled = False
+        self.terminate_calls = 0
+
+    async def close(self) -> None:
+        self.close_entered = True
+        try:
+            # Never set by anyone. Not asyncio.sleep(large): a sleep would
+            # eventually return and could mask a too-generous timeout.
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            self.close_cancelled = True
+            raise
+
+    def terminate(self) -> None:
+        self.terminate_calls += 1
+
+
+class _DrainingPool:
+    """The healthy counterpart: close() completes promptly."""
+
+    def __init__(self) -> None:
+        self.close_calls = 0
+        self.terminate_calls = 0
+
+    async def close(self) -> None:
+        self.close_calls += 1
+
+    def terminate(self) -> None:
+        self.terminate_calls += 1
+
+
+async def test_close_falls_back_to_terminate_when_the_drain_never_finishes(caplog):
+    wedged = _WedgedPool()
+    partner = PartnerPool(pool=wedged, close_timeout_seconds=0.05)
+
+    with caplog.at_level(logging.WARNING, logger="occupancy_graph.source.pool"):
+        # The outer bound is the mutation detector: with the timeout removed
+        # from PartnerPool.close this raises TimeoutError in 5s instead of
+        # hanging out the whole session, so the regression fails loudly.
+        await asyncio.wait_for(partner.close(), timeout=5)
+
+    assert wedged.close_entered is True, "the graceful drain must be attempted first"
+    assert wedged.close_cancelled is True, "the stalled drain must be cancelled, not left running"
+    assert wedged.terminate_calls >= 1, "terminate() is the escape hatch and must be called"
+    assert any(
+        record.levelname == "WARNING" and "terminating" in record.getMessage()
+        for record in caplog.records
+    ), "a silent terminate() teaches us nothing; the fallback must be logged"
+
+
+async def test_close_does_not_terminate_when_the_drain_succeeds(caplog):
+    """The fallback is a fallback. A healthy pool must close gracefully and
+    log nothing -- otherwise every clean shutdown cries wolf."""
+    healthy = _DrainingPool()
+    partner = PartnerPool(pool=healthy, close_timeout_seconds=0.05)
+
+    with caplog.at_level(logging.WARNING, logger="occupancy_graph.source.pool"):
+        await partner.close()
+
+    assert healthy.close_calls == 1
+    assert healthy.terminate_calls == 0
+    assert caplog.records == []
+
+
+def test_the_close_window_is_derived_from_the_statement_timeout():
+    """Long enough that an in-flight query (bounded by statement_timeout) can
+    finish, capped so a large statement timeout cannot push shutdown past the
+    orchestrator's grace period."""
+    assert pool_module.close_timeout_for(20_000) == 25.0
+    assert pool_module.close_timeout_for(1_000) == 6.0
+    # Raising the query budget must widen the window...
+    assert pool_module.close_timeout_for(10_000) > pool_module.close_timeout_for(5_000)
+    # ...but never past the cap.
+    assert pool_module.close_timeout_for(600_000) == pool_module.MAX_CLOSE_TIMEOUT_SECONDS
+
+
+async def test_a_real_pool_carries_the_derived_close_window(fixture_db):
+    pool = await PartnerPool.create(fixture_db, statement_timeout_ms=1_000)
+    try:
+        assert pool.close_timeout_seconds == pool_module.close_timeout_for(1_000)
+    finally:
+        await pool.close()
