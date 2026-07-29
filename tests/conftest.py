@@ -43,11 +43,21 @@ def fixture_db() -> str:
 @pytest_asyncio.fixture(scope="session", loop_scope="session")
 async def fixture_pool(fixture_db: str):
     """Read-only, mirroring the adapter's own pool. Seed data is loaded via psql
-    in fixture_db, not through this pool, so nothing legitimate needs to write."""
-    async def _setup(conn):
-        await conn.execute("SET default_transaction_read_only = on")
+    in fixture_db, not through this pool, so nothing legitimate needs to write.
 
-    pool = await asyncpg.create_pool(fixture_db, min_size=1, max_size=4, init=_setup)
+    `server_settings`, not an `init=` callback running `SET` — for the same
+    reason PartnerPool.create uses it, and this fixture had the identical bug:
+    asyncpg's per-release `RESET ALL` wiped the session `SET`, so this
+    SESSION-SCOPED pool was read-only for one acquire and writable for the rest
+    of the suite. See src/occupancy_graph/source/pool.py's module docstring.
+    Pinned by tests/test_pool.py::test_the_fixture_pool_is_read_only_on_every_acquire.
+    """
+    pool = await asyncpg.create_pool(
+        fixture_db,
+        min_size=1,
+        max_size=4,
+        server_settings={"default_transaction_read_only": "on"},
+    )
     yield pool
     await pool.close()
 

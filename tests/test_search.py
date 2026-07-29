@@ -118,16 +118,41 @@ async def test_rows_for_links_reports_a_timeout_instead_of_raising(fixture_db):
     QueryCanceledError through asyncpg rather than a hand-rolled double, which
     has caught real bugs. But the `if timed_out:` guard means that on a fast
     machine, or once records_*(record_id) is indexed, it may assert NOTHING: the
-    fixture tables hold ~20 rows and a 1 ms statement_timeout is a race, not a
-    guarantee. (Measured 20/20 cancellations on the dev box -- still a race.)
-    It also cannot catch a partial-leak regression, since a single table has no
-    earlier rows to leak.
+    fixture tables hold ~20 rows and the statement_timeout is a race, not a
+    guarantee. It also cannot catch a partial-leak regression, since a single
+    table has no earlier rows to leak.
+
+    5 ms, NOT 1 ms. At 1 ms the cancellation can land between asyncpg's
+    Parse/Describe and Bind/Execute, before the protocol has drained the
+    ErrorResponse, and `InternalClientError: cannot switch to state N; another
+    operation (2) is in progress` raises straight out of conn.fetch -- which
+    fails this test guard or no guard. That is the identical flake already
+    diagnosed and calibrated for this test's sibling in
+    test_resolve.py::test_tax_scan_reports_a_timeout_instead_of_raising, whose
+    docstring measures the usable window at ~2-6 ms and picks 5 ms as the
+    midpoint; that fix set the sibling to 5 ms but left this one at 1 ms.
+
+    Measured here driving this exact call, A/B against the pool's OLD `init=`
+    construction and its current `server_settings` one, to rule out the pool
+    change as the cause:
+
+        1 ms   init=            n=400   7 raised InternalClientError  (1.8%)
+        1 ms   server_settings  n=400   9 raised InternalClientError  (2.3%)
+        5 ms   init=            n=150   150/150 timed out, 0 raised
+        5 ms   server_settings  n=150   150/150 timed out, 0 raised
+
+    The race is pre-existing and construction-independent (7 vs 9 in 400 is
+    noise), and 5 ms clears it either way.
+
+    So 5 ms is also a strengthening, not just a de-flake: at 1 ms the guarded
+    `assert rows == []` was skipped whenever the race went the other way, and at
+    5 ms the cancellation is reliable enough that it actually runs.
 
     The deterministic coverage of the ([], True) contract lives in
     test_a_cancelled_row_fetch_degrades_to_empty_rather_than_raising and
     test_a_timeout_on_the_second_table_does_not_leak_the_first_tables_rows.
     """
-    tiny = await PartnerPool.create(fixture_db, statement_timeout_ms=1)
+    tiny = await PartnerPool.create(fixture_db, statement_timeout_ms=5)
     try:
         links = [{"source_table": "records_legacy", "record_id": n} for n in range(1000, 1200)]
         rows, timed_out = await search.rows_for_links(tiny, links)
@@ -141,11 +166,11 @@ async def test_rows_for_links_reports_a_timeout_instead_of_raising(fixture_db):
 # --- The degradation path, made deterministic -------------------------------
 #
 # The test above cannot be trusted to exercise anything: the fixture tables hold
-# ~20 rows, so a 1 ms statement_timeout usually finishes in time and `if
-# timed_out:` is skipped. The two tests below pin the ([], True) contract by
-# injecting the cancellation instead of racing for it. An empty result mistaken
-# for "this person has no records" is a failure mode this repo has already been
-# bitten by twice (TaxScanResult.queried_city, tax_timed_out).
+# ~20 rows, so on a fast enough box the query finishes inside the statement
+# timeout and `if timed_out:` is skipped. The two tests below pin the ([], True)
+# contract by injecting the cancellation instead of racing for it. An empty
+# result mistaken for "this person has no records" is a failure mode this repo
+# has already been bitten by twice (TaxScanResult.queried_city, tax_timed_out).
 
 
 class _ScriptedPool:

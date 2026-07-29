@@ -1,14 +1,44 @@
 """asyncpg pool for the partner corpus.
 
-Every connection is pinned read-only with a statement timeout at setup, so the
-guarantee holds for every query without each call site remembering to ask.
+Both safety settings — `statement_timeout` and `default_transaction_read_only`
+— are passed as `server_settings`, so they travel in the connection's STARTUP
+PACKET and hold for the whole life of that connection, every acquire.
 
-Scope of the read-only guarantee: `default_transaction_read_only` is a session
+WHY `server_settings` AND NOT `SET` IN AN init=/setup= CALLBACK. This is
+load-bearing; do not "simplify" it back. asyncpg runs a reset script that
+includes `RESET ALL` on every RELEASE (see `Connection.get_reset_query`), so a
+session-level `SET` issued from `init=` survives exactly ONE acquire. Measured
+against the fixture with the previous `init=` version, statement_timeout_ms
+20 000, max_size 1:
+
+    acquire #1: default_transaction_read_only=on   statement_timeout=20s
+    acquire #2: default_transaction_read_only=off  statement_timeout=0
+    acquire #3: default_transaction_read_only=off  statement_timeout=0
+    CREATE TEMP TABLE on the next acquire: SUCCEEDED
+
+`RESET ALL` restores each GUC to its SESSION-START value, and startup-packet
+options ARE that value — which is precisely why `server_settings` survives the
+reset and `SET` does not. In a long-lived service the first request was the
+only protected one.
+
+The timeout half is the quieter of the two failures. It reset to `0`, which
+Postgres reads as UNLIMITED — the exact state `create()` below raises
+`ValueError` to prevent, arrived at silently one release later. From that point
+every typed operation and the SQL hatch ran against a 7.6 B-row partner corpus
+with no cost bound at all.
+
+SCOPE OF THE READ-ONLY GUARANTEE. `default_transaction_read_only` is a session
 DEFAULT, not a security boundary. Idiomatic asyncpg usage cannot escape it —
 including `conn.transaction(readonly=False)`, which omits the qualifier rather
 than forcing READ WRITE — but raw `BEGIN READ WRITE` or `SET TRANSACTION READ
-WRITE` will. We control every call site, so this is adequate here; the durable
-protection is the partner granting a role without write privileges.
+WRITE` will; that is pinned in
+tests/test_pool.py::test_read_only_is_a_session_default_not_a_boundary.
+
+We no longer control every call site. The SQL hatch executes agent-authored
+SQL, so `service/sql_guard.py` — not this default — is the PRIMARY write
+control; this pool is a second layer behind it. The durable protection remains
+the partner granting a role with no write privileges at all, which is the only
+one of the three that an unforeseen statement shape cannot walk through.
 """
 from __future__ import annotations
 
@@ -96,12 +126,25 @@ class PartnerPool:
                 "without bound against the partner corpus."
             )
 
-        async def _setup(conn: asyncpg.Connection) -> None:
-            await conn.execute(f"SET statement_timeout = {int(statement_timeout_ms)}")
-            await conn.execute("SET default_transaction_read_only = on")
-
+        # Startup-packet settings, NOT an init=/setup= callback running `SET`.
+        # asyncpg's per-release `RESET ALL` wipes session `SET`s but restores
+        # startup-packet values, so only this form survives a release. The
+        # module docstring has the measurements. Values must be strings.
+        #
+        # No belt-and-braces `setup=` re-apply alongside this: it would cost a
+        # round trip on every acquire and create a second place the truth can
+        # live, and there is no state it would catch that this does not — a
+        # `SET` issued *within* an acquire is the SQL hatch's problem
+        # (sql_guard refuses VariableSetStmt), and `setup=` runs before the
+        # query, so it could not catch that either.
         pool = await asyncpg.create_pool(
-            dsn, min_size=min_size, max_size=max_size, init=_setup
+            dsn,
+            min_size=min_size,
+            max_size=max_size,
+            server_settings={
+                "statement_timeout": str(int(statement_timeout_ms)),
+                "default_transaction_read_only": "on",
+            },
         )
         return cls(
             pool=pool, close_timeout_seconds=close_timeout_for(statement_timeout_ms)

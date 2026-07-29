@@ -4,7 +4,9 @@ We are a read-only guest on someone else's production database, so these tests
 go beyond the happy path in the plan: every write statement type must be
 rejected (not just CREATE), a timed-out statement must not poison the
 connection for the next query, and the read-only/timeout settings must land on
-every pooled connection, not just the first one created.
+every pooled connection -- not just the first one created, and not just its
+first acquire. That last clause is the one a shipped defect was hiding behind:
+see the regression block below.
 """
 from __future__ import annotations
 
@@ -153,6 +155,217 @@ async def test_settings_apply_to_every_pooled_connection(fixture_db):
         assert timeout == "1234ms"
 
 
+# --- Regression: the settings must survive RELEASE, not just connection creation
+#
+# THE DEFECT THIS PINS. `create()` used to apply both settings from asyncpg's
+# `init=` callback, which runs once per CONNECTION CREATION. asyncpg runs a reset
+# script containing `RESET ALL` on every RELEASE, which wipes session-level
+# `SET`s -- so both settings survived exactly ONE acquire and then silently
+# vanished for the life of the process. Measured on the fixture before the fix:
+#
+#     acquire #1: default_transaction_read_only=on   statement_timeout=20s
+#     acquire #2: default_transaction_read_only=off  statement_timeout=0
+#     acquire #3: default_transaction_read_only=off  statement_timeout=0
+#     CREATE TEMP TABLE on the next acquire: SUCCEEDED
+#
+# `test_settings_apply_to_every_pooled_connection` above did NOT catch it: its
+# four concurrent acquires force four DISTINCT connections, so every one of them
+# is on its first acquire and `init=` is still intact. The distinguishing
+# condition is reuse, which is why max_size=1 and the pg_backend_pid assertions
+# below are load-bearing rather than decoration -- without them these tests would
+# silently degrade back into the weaker one they replace.
+
+
+async def _observe(conn) -> tuple[int, str, str, str]:
+    """(backend pid, session default, effective tx setting, statement timeout).
+
+    Both read-only GUCs are read: `default_transaction_read_only` is what we set,
+    `transaction_read_only` is what a statement outside an explicit transaction
+    actually runs under. Asserting only the former would miss a world where the
+    default is set but does not take effect.
+    """
+    return (
+        await conn.fetchval("SELECT pg_backend_pid()"),
+        await conn.fetchval("SHOW default_transaction_read_only"),
+        await conn.fetchval("SHOW transaction_read_only"),
+        await conn.fetchval("SHOW statement_timeout"),
+    )
+
+
+async def test_settings_survive_release_and_reacquire(fixture_db):
+    """The regression test for the release-reset defect: assert on the SECOND
+    and THIRD acquires of the SAME connection, and probe a write on a fourth."""
+    pool = await PartnerPool.create(
+        fixture_db, statement_timeout_ms=1234, min_size=1, max_size=1
+    )
+    try:
+        observed = []
+        for _ in range(3):
+            async with pool.acquire() as conn:
+                observed.append(await _observe(conn))
+
+        # The write probe is the end-to-end statement of the bug: pre-fix this
+        # CREATE succeeded. TEMP so that a regression cannot leave residue in
+        # the session-scoped fixture schema.
+        async with pool.acquire() as conn:
+            with pytest.raises(asyncpg.exceptions.ReadOnlySQLTransactionError):
+                await conn.execute("CREATE TEMP TABLE reacquire_write_probe (x int)")
+    finally:
+        await pool.close()
+
+    pids = {pid for pid, *_ in observed}
+    assert pids == {observed[0][0]}, (
+        "max_size=1 must recycle ONE connection across the three acquires -- "
+        f"got {len(pids)} distinct backends {pids}. Distinct connections would "
+        "make this test pass even with the init= bug present, because each would "
+        "be on its first acquire."
+    )
+
+    for attempt, (_, default_ro, tx_ro, timeout) in enumerate(observed, start=1):
+        assert default_ro == "on", f"acquire #{attempt}: default_transaction_read_only"
+        assert tx_ro == "on", f"acquire #{attempt}: transaction_read_only"
+        assert timeout == "1234ms", f"acquire #{attempt}: statement_timeout"
+
+
+@pytest.mark.parametrize("statement_timeout_ms,shown", [(1234, "1234ms"), (20_000, "20s")])
+async def test_the_statement_timeout_is_never_reset_to_unlimited(
+    fixture_db, statement_timeout_ms, shown
+):
+    """The quieter half of the defect, asserted on its own.
+
+    The read-only reset is the loud failure; this is the one that removes the
+    COST bound without anyone noticing. `RESET ALL` restored statement_timeout
+    to the server default of `0`, which Postgres reads as UNLIMITED -- exactly
+    the state `create()` raises ValueError to refuse, reached silently one
+    release later. `!= "0"` is asserted separately from the equality so the
+    failure message says which of the two things went wrong.
+    """
+    pool = await PartnerPool.create(
+        fixture_db, statement_timeout_ms=statement_timeout_ms, min_size=1, max_size=1
+    )
+    try:
+        for attempt in range(1, 4):
+            async with pool.acquire() as conn:
+                timeout = await conn.fetchval("SHOW statement_timeout")
+                raw = await conn.fetchval(
+                    "SELECT setting FROM pg_settings WHERE name = 'statement_timeout'"
+                )
+            assert timeout != "0", (
+                f"acquire #{attempt}: statement_timeout is 0, which Postgres reads "
+                "as UNLIMITED -- the cost bound on the partner corpus is gone"
+            )
+            assert timeout == shown, f"acquire #{attempt}"
+            assert raw == str(statement_timeout_ms), f"acquire #{attempt}"
+    finally:
+        await pool.close()
+
+
+async def test_the_statement_timeout_still_bites_after_a_release(fixture_db):
+    """Behavioural proof, and the post-error-release case.
+
+    `SHOW` says what the GUC holds; this says the server still ACTS on it. The
+    first acquire ends in a cancelled statement, so the connection is returned to
+    the pool in the state that most plausibly loses its settings -- and the
+    second acquire must still cancel.
+    """
+    pool = await PartnerPool.create(
+        fixture_db, statement_timeout_ms=250, min_size=1, max_size=1
+    )
+    try:
+        async with pool.acquire() as conn:
+            first_pid = await conn.fetchval("SELECT pg_backend_pid()")
+            with pytest.raises(asyncpg.QueryCanceledError):
+                await conn.fetch("SELECT pg_sleep(2)")
+
+        async with pool.acquire() as conn:
+            assert await conn.fetchval("SELECT pg_backend_pid()") == first_pid, (
+                "the same connection must come back, or this proves nothing "
+                "about release"
+            )
+            assert await conn.fetchval("SHOW statement_timeout") == "250ms"
+            with pytest.raises(asyncpg.QueryCanceledError):
+                await conn.fetch("SELECT pg_sleep(2)")
+    finally:
+        await pool.close()
+
+
+async def test_the_settings_survive_a_release_that_followed_a_refused_write(fixture_db):
+    """The other post-error release: a connection returned after the read-only
+    refusal itself must not come back writable."""
+    pool = await PartnerPool.create(
+        fixture_db, statement_timeout_ms=1234, min_size=1, max_size=1
+    )
+    try:
+        async with pool.acquire() as conn:
+            first_pid = await conn.fetchval("SELECT pg_backend_pid()")
+            with pytest.raises(asyncpg.exceptions.ReadOnlySQLTransactionError):
+                await conn.execute("CREATE TEMP TABLE post_error_probe (x int)")
+
+        async with pool.acquire() as conn:
+            pid, default_ro, tx_ro, timeout = await _observe(conn)
+            assert pid == first_pid
+            assert (default_ro, tx_ro, timeout) == ("on", "on", "1234ms")
+            with pytest.raises(asyncpg.exceptions.ReadOnlySQLTransactionError):
+                await conn.execute("CREATE TEMP TABLE post_error_probe (x int)")
+    finally:
+        await pool.close()
+
+
+async def test_settings_hold_when_one_connection_is_recycled_between_acquirers(
+    fixture_db,
+):
+    """Recycling under contention, which is the production shape: max_size=1 and
+    six concurrent acquirers means five of them get a connection that has been
+    through asyncpg's release path, not a freshly created one."""
+    pool = await PartnerPool.create(
+        fixture_db, statement_timeout_ms=1234, min_size=1, max_size=1
+    )
+
+    async def _probe():
+        async with pool.acquire() as conn:
+            # Hold it so the others really have to queue for this one connection.
+            await asyncio.sleep(0.01)
+            return await _observe(conn)
+
+    try:
+        results = await asyncio.gather(*(_probe() for _ in range(6)))
+    finally:
+        await pool.close()
+
+    assert len({pid for pid, *_ in results}) == 1, (
+        "max_size=1 must serve all six acquirers from one recycled connection"
+    )
+    for pid, default_ro, tx_ro, timeout in results:
+        assert (default_ro, tx_ro, timeout) == ("on", "on", "1234ms")
+
+
+async def test_the_fixture_pool_is_read_only_on_every_acquire(fixture_pool):
+    """conftest's `fixture_pool` had the identical `init=` bug, and it is
+    SESSION-scoped: it was read-only for one acquire and writable for the rest of
+    the suite, so any test trusting its docstring was trusting nothing."""
+    seen = []
+    for _ in range(3):
+        async with fixture_pool.acquire() as conn:
+            seen.append(
+                (
+                    await conn.fetchval("SELECT pg_backend_pid()"),
+                    await conn.fetchval("SHOW default_transaction_read_only"),
+                    await conn.fetchval("SHOW transaction_read_only"),
+                )
+            )
+
+    assert len({pid for pid, *_ in seen}) == 1, (
+        "sequential acquires must come back to the same LIFO connection, or this "
+        "does not exercise release at all"
+    )
+    for _, default_ro, tx_ro in seen:
+        assert (default_ro, tx_ro) == ("on", "on")
+
+    async with fixture_pool.acquire() as conn:
+        with pytest.raises(asyncpg.exceptions.ReadOnlySQLTransactionError):
+            await conn.execute("CREATE TEMP TABLE fixture_pool_write_probe (x int)")
+
+
 # --- Extra verification 4: from_env ---
 
 
@@ -227,10 +440,25 @@ async def test_read_only_is_a_session_default_not_a_boundary(fixture_db, scratch
     not an enforced boundary: raw `BEGIN READ WRITE` overrides it and the
     write succeeds. If this ever stops being true, we want to notice --
     idiomatic asyncpg usage (e.g. conn.transaction(readonly=False)) does NOT
-    defeat the default, only raw SQL text like this does."""
+    defeat the default, only raw SQL text like this does.
+
+    The negative control below is not optional. `BEGIN READ WRITE` + INSERT
+    succeeds trivially on a session that was never read-only in the first place,
+    so without it this test asserts nothing about the DEFAULT being defeated --
+    only that the fixture is writable. It happened to be testing the real thing
+    (a fresh pool hands out its pre-created connection first, and `init=` was
+    still intact on that one acquire), but nothing pinned it there, and it would
+    have passed unchanged on any of the acquires where the settings had already
+    been reset away."""
     pool = await PartnerPool.create(fixture_db, statement_timeout_ms=5000)
     try:
         async with pool.acquire() as conn:
+            assert await conn.fetchval("SHOW transaction_read_only") == "on"
+            with pytest.raises(asyncpg.exceptions.ReadOnlySQLTransactionError):
+                await conn.execute(
+                    f"INSERT INTO {scratch_table} (id, val) VALUES (98, 'refused')"
+                )
+
             await conn.execute("BEGIN READ WRITE")
             try:
                 await conn.execute(
