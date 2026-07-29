@@ -7,6 +7,19 @@
 | `SQL_HATCH_MAX_PLAN_COST` | `5000000` | Refuse if the root plan node's `Total Cost` exceeds this. |
 | `SQL_HATCH_MAX_RECORDS_SEQSCAN_COST` | `50000` | Refuse if any `Seq Scan` node on a `records_*` relation exceeds this. |
 
+Both accept any finite value `>= 0`. `0` is the *strictest* setting, not a broken one — it
+refuses everything, which makes a useful kill switch. `inf` and `nan` are **rejected at read
+time**: the gate is `if cost > ceiling: refuse`, and both `cost > inf` and `cost > nan` are
+False for every cost, so either value would silently turn the ceiling into an unconditional
+allow. Reach for `0`, never `inf`, when you want to change the gate's behaviour wholesale.
+
+Two further knobs bound the hatch operationally, and both require `>= 1`:
+
+| Env var | Default | Meaning |
+|---|---|---|
+| `SQL_HATCH_MAX_ROWS` | `500` | Rows returned by one hatch query. |
+| `SQL_HATCH_TIMEOUT_MS` | `20000` | Per-statement timeout. **`0` is refused** — Postgres reads it as UNLIMITED, so it would let one LLM-authored query run without bound against a 3.7 TB third-party production database. The row cap is no substitute: it bounds rows *returned*, not work done, and `count(*)` returns one row after a full scan. |
+
 ## How 5 000 000 was derived
 
 The live corpus was **not** reachable when this shipped (`.pgenv` credentials absent), so the

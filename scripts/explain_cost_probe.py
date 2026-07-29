@@ -18,12 +18,8 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
-import sys
-from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-
-import asyncpg  # noqa: E402
+import asyncpg
 
 MUST_SERVE = {
     "zip + address prefix (records_legacy)": """
@@ -34,7 +30,7 @@ MUST_SERVE = {
         SELECT * FROM public.records_partitioned
         WHERE zip = $$40505$$ AND address ILIKE $$123 MAIN%$$ LIMIT 200
     """,
-    "upper(state)+upper(city) + prefix (property_owner)": """
+    "upper(state)+upper(city) + prefix, phase-2 shape (records_partitioned)": """
         SELECT * FROM public.records_partitioned
         WHERE upper(state) = $$KY$$ AND upper(city) = $$LEXINGTON$$
           AND address ILIKE $$123 MAIN%$$ LIMIT 200
