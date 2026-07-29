@@ -10,6 +10,7 @@ records_legacy (6.24 B rows).
 from __future__ import annotations
 
 import json
+from collections import Counter
 from dataclasses import dataclass, field
 
 from occupancy_graph.normalize import normalize_address, zip5
@@ -85,15 +86,28 @@ async def scan_zip_sources(pool: PartnerPool, query: AddressQuery) -> ZipScanRes
         for table in FEEDS[shape].tables:
             rows = await _scan_one(pool, table, shape, query)
             result.rows_by_shape[shape].extend(rows)
+        # MAX_ROWS_PER_SHAPE is a per-SHAPE budget. _scan_one applies it per
+        # table, so a multi-table shape like `base` would otherwise get double.
+        del result.rows_by_shape[shape][MAX_ROWS_PER_SHAPE:]
 
-    for rows in result.rows_by_shape.values():
-        for row in rows:
-            if result.city is None and row.get("city"):
-                result.city = str(row["city"]).strip().upper()
-            if result.state is None and row.get("state"):
-                result.state = str(row["state"]).strip().upper()
-        if result.city and result.state:
-            break
+    cities = Counter(
+        str(row["city"]).strip().upper()
+        for rows in result.rows_by_shape.values()
+        for row in rows
+        if row.get("city")
+    )
+    states = Counter(
+        str(row["state"]).strip().upper()
+        for rows in result.rows_by_shape.values()
+        for row in rows
+        if row.get("state")
+    )
+    # Majority vote, not first-seen: fetch() has no ORDER BY, and the loose
+    # address prefix can admit a different street in the same ZIP. Task 13's
+    # property_owner scan is driven by these, so a wrong city silently yields
+    # no tax rows. Ties broken by name for determinism.
+    result.city = min(cities, key=lambda c: (-cities[c], c)) if cities else None
+    result.state = min(states, key=lambda s: (-states[s], s)) if states else None
     return result
 
 
