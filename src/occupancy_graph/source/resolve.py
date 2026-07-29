@@ -10,6 +10,7 @@ records_legacy (6.24 B rows).
 from __future__ import annotations
 
 import json
+import logging
 from collections import Counter
 from dataclasses import dataclass, field
 
@@ -27,6 +28,8 @@ ZIP_SHAPES = ("utility", "trace", "base", "loan", "drive", "auto")
 # Per-shape materialization ceiling. Tool calls cap at 100 and preflight at 10,
 # so 200 leaves headroom while bounding a dense apartment building.
 MAX_ROWS_PER_SHAPE = 200
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -146,6 +149,14 @@ class TaxScanResult:
     rows: list[dict] = field(default_factory=list)
     dropped: int = 0
     timed_out: bool = False
+    # What this scan actually searched. An empty `rows` with timed_out=False is
+    # ambiguous -- the property may genuinely have no assessor record, OR
+    # phase 1's majority-vote city may have been wrong for this address (the
+    # address prefix is loose enough to admit a neighbouring street).
+    # Recording the parameters makes that distinguishable downstream instead
+    # of silent.
+    queried_city: str | None = None
+    queried_state: str | None = None
 
 
 async def scan_tax_source(
@@ -160,10 +171,16 @@ async def scan_tax_source(
     expiry we report tax as absent rather than failing the investigation. The
     engine degrades correctly on its own — case_quality_and_synthesis flips to
     run_for_absence and the tax packets skip on their field gate.
+
+    `dropped` counts quality-gate rejections among the rows actually fetched:
+    if MAX_ROWS_PER_SHAPE truncates the candidate set, a column-shifted row
+    past the cutoff is never fetched and never counted, so `dropped` can
+    under-report the true corruption rate in the corpus.
     """
     if not city or not state:
-        return TaxScanResult()
+        return TaxScanResult(queried_city=city, queried_state=state)
 
+    city_upper, state_upper = city.upper(), state.upper()
     clause, patterns = feed_clause("tax", start_index=4)
     sql = f"""
         SELECT *
@@ -176,9 +193,17 @@ async def scan_tax_source(
     """
     try:
         async with pool.acquire() as conn:
-            rows = await conn.fetch(sql, state.upper(), city.upper(), query.like_prefix, *patterns)
-    except asyncpg.QueryCanceledError:
-        return TaxScanResult(timed_out=True)
+            rows = await conn.fetch(sql, state_upper, city_upper, query.like_prefix, *patterns)
+    except asyncpg.QueryCanceledError as exc:
+        # QueryCanceledError also fires for an admin pg_cancel_backend, not
+        # just a statement_timeout expiry -- same sqlstate 57014, only the
+        # message differs. Both degrade identically (tax absent), so no
+        # behaviour change; the log line just gives on-call a way to tell
+        # which one happened.
+        logger.warning(
+            "tax scan cancelled (city=%s, state=%s): %s", city_upper, state_upper, exc
+        )
+        return TaxScanResult(timed_out=True, queried_city=city_upper, queried_state=state_upper)
 
     kept: list[dict] = []
     dropped = 0
@@ -188,4 +213,6 @@ async def scan_tax_source(
             kept.append(decoded)
         else:
             dropped += 1
-    return TaxScanResult(rows=kept, dropped=dropped)
+    return TaxScanResult(
+        rows=kept, dropped=dropped, queried_city=city_upper, queried_state=state_upper
+    )

@@ -149,6 +149,8 @@ async def test_tax_scan_finds_the_property_owner_row(pool):
     assert result.timed_out is False
     ids = {row["record_id"] for row in result.rows}
     assert 4001 in ids
+    assert result.queried_city == "LEXINGTON"
+    assert result.queried_state == "KY"
 
 
 async def test_tax_scan_drops_column_shifted_rows_and_counts_them(pool):
@@ -164,6 +166,8 @@ async def test_tax_scan_without_city_or_state_returns_empty_not_an_error(pool):
     result = await scan_tax_source(pool, query, city=None, state=None)
     assert result.rows == []
     assert result.timed_out is False
+    assert result.queried_city is None
+    assert result.queried_state is None
 
 
 async def test_tax_scan_reports_a_timeout_instead_of_raising(fixture_db):
@@ -175,3 +179,20 @@ async def test_tax_scan_reports_a_timeout_instead_of_raising(fixture_db):
         await pool.close()
     assert result.timed_out is True
     assert result.rows == []
+    assert result.queried_city == "LEXINGTON"
+    assert result.queried_state == "KY"
+
+
+async def test_tax_scan_empty_result_is_ambiguous_between_no_record_and_wrong_city(pool):
+    """A wrong city yields the same empty/not-timed-out shape as a genuine
+    "no assessor record" result -- the phase-1 majority vote can pick a city
+    that's wrong for this address, since the address prefix is loose enough
+    to admit a neighbouring street. `queried_city`/`queried_state` don't
+    resolve the ambiguity, but they make it visible: a caller can see the
+    scan searched somewhere unexpected instead of just seeing an empty list."""
+    query = AddressQuery.build("123 Main St", "40505")
+    result = await scan_tax_source(pool, query, city="NOWHERE", state="KY")
+    assert result.rows == []
+    assert result.timed_out is False
+    assert result.queried_city == "NOWHERE"
+    assert result.queried_state == "KY"
