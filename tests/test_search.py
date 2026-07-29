@@ -88,6 +88,10 @@ async def test_person_for_hal_id_returns_the_entity(pool):
 async def test_records_for_hal_id_returns_every_link_highest_confidence_first(pool):
     links = await search.records_for_hal_id(pool, "HAL0001", limit=50)
     assert [(link["source_table"], link["record_id"]) for link in links] == [
+        # 2010 (the owner-elsewhere payday row) is seeded at confidence 0.95, above
+        # every other HAL0001 link, so it leads. 1002 and 2001 tie at 0.90 and are
+        # broken by source_table ASC; 1004 trails at 0.85.
+        ("records_partitioned", 2010),
         ("records_legacy", 1002), ("records_new", 2001), ("records_legacy", 1004),
     ]
 
@@ -96,7 +100,7 @@ async def test_rows_for_links_fetches_across_both_physical_tables(pool):
     links = await search.records_for_hal_id(pool, "HAL0001", limit=50)
     rows, timed_out = await search.rows_for_links(pool, links)
     assert timed_out is False
-    assert {row["record_id"] for row in rows} == {1002, 1004, 2001}
+    assert {row["record_id"] for row in rows} == {1002, 1004, 2001, 2010}
     # raw_data must arrive decoded, exactly as the address scan delivers it.
     payday = next(row for row in rows if row["record_id"] == 2001)
     assert payday["raw_data"]["loan_amount"] == "500"

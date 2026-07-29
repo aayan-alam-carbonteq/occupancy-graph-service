@@ -74,14 +74,21 @@ async def test_a_hal_person_returns_the_linked_rows_projected_by_shape(client):
     assert body["records_by_source"]["trace"]["total_count"] == 1
     assert body["records_by_source"]["trace"]["records"][0]["firstname"] == "Jane"
     assert body["records_by_source"]["base"]["total_count"] == 1
-    assert body["records_by_source"]["loan"]["total_count"] == 1
-    assert body["records_by_source"]["loan"]["records"][0]["employer"] == "ACME"
+    # Two loan rows: 2001 at the subject address and 2010 elsewhere. Ordered by
+    # record_id, so 2001 (employer ACME) leads and 2010 (GLOBEX) follows.
+    assert body["records_by_source"]["loan"]["total_count"] == 2
+    assert [r["employer"] for r in body["records_by_source"]["loan"]["records"]] == [
+        "ACME", "GLOBEX",
+    ]
 
 
 async def test_a_payday_row_reached_by_hal_id_is_both_loan_and_drive(client):
     body = (await client.get("/v1/person/hal:HAL0001/records")).json()
-    assert body["records_by_source"]["drive"]["total_count"] == 1
+    assert body["records_by_source"]["drive"]["total_count"] == 2
     assert body["records_by_source"]["drive"]["records"][0]["dl_num"] == "A12345678"
+    assert [r["dl_num"] for r in body["records_by_source"]["drive"]["records"]] == [
+        "A12345678", "B98765432",
+    ]
 
 
 async def test_identity_confidence_and_is_suspicious_are_surfaced(client):
@@ -120,3 +127,51 @@ async def test_hal_records_report_the_timeout_flag(client):
 
 async def test_an_unknown_hal_id_is_a_404(client):
     assert (await client.get("/v1/person/hal:HAL9999/records")).status_code == 404
+
+
+async def test_a_hal_persons_rows_span_addresses_in_a_stable_record_id_order(client):
+    """Owner-elsewhere, and the reason `_by_record_id` exists.
+
+    HAL0001's links reach payday rows at TWO addresses: 2001 at the subject
+    address and 2010 at 742 EVERGREEN TER in another ZIP, which the address scan
+    can never see. That is the signal the hal: path is for.
+
+    It also pins the ORDER. rows_for_links groups by physical table and selects
+    `WHERE record_id = ANY(...)` with no ORDER BY, and it fetches those groups in
+    LINK order -- 2010 is seeded at the highest confidence, so it comes back
+    first. Sorting by record_id in the handler is what makes `records[0]`
+    reproducible; drop the sort and this list inverts to 2010, 2001.
+    """
+    body = (await client.get("/v1/person/hal:HAL0001/records?shapes=loan")).json()
+    block = body["records_by_source"]["loan"]
+    assert block["total_count"] == 2
+    assert [r["loan_id"] for r in block["records"]] == ["2001", "2010"]
+    assert [r["address"] for r in block["records"]] == ["123 MAIN ST", "742 EVERGREEN TER"]
+
+
+async def test_a_column_shifted_tax_row_reached_by_hal_id_is_dropped_not_served(client):
+    """The fail-closed tax gate runs on the hal: path too.
+
+    HAL0002 links record 4003 -- a property_owner row whose embedded GeoJSON was
+    split on its commas upstream, sliding every later field. `shapes_for_row`
+    still classifies it as `tax` (its source_file matches property_owner%), so
+    without quality.tax_row_is_usable it would be projected and served, and
+    "PENGROVE ST" would reach the model as an owner name. Removing the gate turns
+    this count from 0 into 1.
+
+    HONEST NOTE ON REACHABILITY -- read before deleting this branch as dead code:
+    the partner-DB survey found property_owner rows are absent from entity_links
+    ENTIRELY (0 of 200 sampled). They carry ssn, dob and house_number at 0%
+    populated, so the ER graph has no blocking key to link them by. In production
+    this branch is therefore expected to be unreachable. The link that makes this
+    test work is SYNTHETIC and is NOT evidence that production links tax rows.
+    The gate stays because it is the same fail-closed gate the address path
+    applies, it costs one condition, and if the partner ever does begin linking
+    property rows it is already proven rather than assumed.
+    """
+    body = (await client.get("/v1/person/hal:HAL0002/records")).json()
+    assert body["records_by_source"]["tax"]["total_count"] == 0
+    assert body["records_by_source"]["tax"]["records"] == []
+    # The traversal itself ran and did reach records_partitioned; the tax row was
+    # fetched and shape-classified, then dropped. The trace row is the control.
+    assert body["records_by_source"]["trace"]["total_count"] == 1

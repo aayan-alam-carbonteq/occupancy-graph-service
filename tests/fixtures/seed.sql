@@ -147,4 +147,41 @@ VALUES
   ('HAL0001', 'records_new',    2001, 'name_dob', 0.90),
   ('HAL0002', 'records_legacy', 1003, 'name_dob', 0.70);
 
+-- OWNER-ELSEWHERE: the case the hal: traversal exists for.
+-- Jane Doe is the owner of record at 123 MAIN ST (tax row 4001 mails to Aurora,
+-- IL), and her ER entity ALSO links a payday row at a different street in a
+-- different ZIP. Without this row the fixture could only express the degenerate
+-- case -- one entity, three rows, all at the single address already resolved --
+-- which is not what the engine consumes.
+--
+-- ZIP 41042 is deliberately outside the 40505 subject address, so the address
+-- scan (`WHERE zip = $1`) can never see this row. It is reachable ONLY through
+-- entity_links, which is the whole point, and it keeps the 123 MAIN ST bundle's
+-- loan/drive counts at 1 so no address-path assertion moves.
+INSERT INTO public.records_partitioned
+  (record_id, source_file, imported_at, first_name, last_name, address, city, state, zip,
+   own_rent, employer, occupation, dl_number, dl_state, raw_data)
+VALUES
+  (2010, 'Payday_Big_1/Payday_Big_1.csv', '2026-02-10', 'Jane', 'Doe',
+   '742 EVERGREEN TER', 'FLORENCE', 'KY', '41042', 'RENT', 'GLOBEX', 'Manager',
+   'B98765432', 'KY',
+   '{"loan_amount": "750", "monthly_income": "3000", "month_pay": "U"}'::jsonb);
+
+-- Attributed at a HIGHER confidence than any other HAL0001 link, so
+-- records_for_hal_id returns it FIRST and rows_for_links therefore fetches its
+-- physical table FIRST. That puts the natural fetch order (2010, 1002, 1004,
+-- 2001) OUT of record_id order on purpose: it is what makes the handler's sort
+-- observable. Without the sort the two-row `loan` block leads with 2010.
+-- `records_partitioned` (not `records_new`) so the third PHYSICAL_TABLES entry
+-- is exercised against a real database rather than only against fakes.
+INSERT INTO silver.entity_links (hal_id, source_table, record_id, match_type, confidence)
+VALUES ('HAL0001', 'records_partitioned', 2010, 'name_address', 0.95);
+
+-- Links the COLUMN-SHIFTED property_owner row (4003) so the hal: path's
+-- tax_row_is_usable gate executes in its REJECTING direction.
+-- SYNTHETIC: production entity_links contains NO property_owner rows at all
+-- (0 of 200 sampled) -- see the note on the test that consumes this.
+INSERT INTO silver.entity_links (hal_id, source_table, record_id, match_type, confidence)
+VALUES ('HAL0002', 'records_partitioned', 4003, 'name_address', 0.55);
+
 ANALYZE;
