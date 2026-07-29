@@ -7,52 +7,72 @@ the INSERT commits. That was acceptable while we controlled every call site; it
 is not once the agent writes SQL. Nothing downstream of this module is a write
 control.
 
-WHY A HAND-WRITTEN LEXER, NOT A SQL PARSER LIBRARY. The value of this guard is
-that it can be reasoned about completely. It has three rules -- one statement, a
-SELECT/WITH head, and no statement keyword ANYWHERE -- applied to text with all
-comments and literals removed. The "anywhere" rule is strictly more conservative
-than an AST walk (it also refuses `WHERE col = 'INSERT'` written without quotes,
-which is not valid SQL anyway) and it covers DML-in-CTE without modelling CTEs.
-Every failure mode of the lexer fails toward refusal: an unterminated literal is
-refused, and text mistakenly treated as code hits the keyword rule.
+WHY POSTGRES'S OWN PARSER, NOT A HAND-WRITTEN LEXER. The first draft of this
+module lexed the SQL itself and applied three textual rules, on the theory that
+a guard you can read end to end is a guard you can trust. That theory did not
+survive an adversarial pass. Both Critical findings were the same failure: code
+that looked careful but simply DISAGREED with PostgreSQL's real lexer.
+
+  * A carriage return ends a `--` comment in Postgres (scan.l defines
+    non_newline as [^\\n\\r]). The hand lexer scanned only for "\\n", so
+    `SELECT 1 --x\\r; DROP TABLE t` was seen as ONE statement here while the
+    server ran two.
+  * Quoting a lowercase identifier is a NO-OP to Postgres, so
+    `SELECT "pg_read_file"('/etc/passwd')` calls exactly that function. The
+    hand lexer erased quoted identifiers and saw nothing to refuse.
+
+Neither bug was a slip in the rules; both were the rules being applied to a
+different language than the server speaks. A write control whose correctness
+depends on independently re-deriving another parser's lexer is the wrong shape.
+
+So this module now parses with `pglast`, which wraps libpg_query -- PostgreSQL's
+own parser sources, not a reimplementation. There is no second lexer to keep in
+sync, and the rules become STRUCTURAL facts about the parse tree rather than
+guesses about text.
+
+VERSION SKEW. pglast 8.4 exposes PostgreSQL 18.4's grammar; the fixture (and the
+partner corpus) run 17. The skew fails safe in BOTH directions. Syntax that 18
+accepts and 17 rejects is passed through and produces a harmless server-side
+syntax error -- 17 never executes it. Syntax that 18 rejects because it was
+removed becomes a ParseError here, which is a refusal: a false positive, never a
+bypass. There is no direction in which the newer grammar lets a write through an
+older server.
+
+WHAT THIS MODULE DOES NOT COVER. The structural rules bound the SHAPE of the
+statement, not its effects: a function call is shaped exactly like a read
+whether or not it writes. `SELECT nextval('s')` is one SelectStmt with no other
+statement node anywhere in its tree, yet it commits a write. So the blocked
+function list below is genuinely load-bearing rather than defence in depth --
+and a denylist of names can never be proven complete. It is written as FAMILY
+PREFIXES for that reason, and the partner credential being a read-only guest
+remains the backstop for anything a future Postgres names in a family not listed
+here.
 
 False positives are acceptable and observable -- the refusal names the exact
-keyword. A false negative is not.
-
-WHAT THIS MODULE DOES NOT COVER. Rules 1-3 bound the SHAPE of the statement, not
-its effects: a function call is shaped exactly like a read whether or not it
-writes. `SELECT nextval('s')` is one statement, has a SELECT head, and contains
-no statement keyword, yet it commits a write. So the blocked-function list below
-is genuinely load-bearing rather than defence in depth -- and a denylist of names
-can never be proven complete. It is written as FAMILY PREFIXES for that reason,
-and the partner credential being a read-only guest remains the backstop for
-anything a future Postgres names in a family not listed here.
+statement type, function or clause. A false negative is not.
 """
 from __future__ import annotations
 
-import re
 import unicodedata
+from collections.abc import Iterator
+from typing import Any
 
-# Keywords refused ANYWHERE in the statement, not merely at the head. INSERT /
-# UPDATE / DELETE / MERGE are the four statements Postgres permits inside a CTE
-# and are the reason this rule is positional-independent; the rest cannot reach
-# a CTE but cost nothing to deny and close off any chaining the ';' rule misses.
-# INTO blocks `SELECT ... INTO newtable`. RETURNING cannot appear in a plain
-# SELECT, so denying it is free and is a second signal on DML-in-CTE.
+from pglast import ast as pg_ast
+from pglast import parse_sql
+from pglast.enums import LockClauseStrength
+from pglast.parser import ParseError
+
+# The only two node types ending in "Stmt" a read-only query may contain.
+# RawStmt is the parser's per-statement envelope; SelectStmt is the query.
 #
-# SHARE and KEY are here for `SELECT ... FOR SHARE` / `FOR KEY SHARE`: those are
-# row locks, they take real locks that outlive the statement inside a
-# transaction and block other writers, and unlike `FOR UPDATE` / `FOR NO KEY
-# UPDATE` they contain no otherwise-denied word. `OF` is not denied (it is a
-# common column name and `FOR ... OF` is unreachable without SHARE or UPDATE).
-_STATEMENT_KEYWORDS = frozenset({
-    "INSERT", "UPDATE", "DELETE", "MERGE", "TRUNCATE", "INTO", "RETURNING",
-    "CREATE", "ALTER", "DROP", "GRANT", "REVOKE", "COPY", "DO", "CALL",
-    "BEGIN", "COMMIT", "ROLLBACK", "START", "SAVEPOINT", "RELEASE",
-    "SET", "RESET", "VACUUM", "ANALYZE", "CLUSTER", "REINDEX", "REFRESH",
-    "LOCK", "PREPARE", "EXECUTE", "DEALLOCATE", "DISCARD", "LISTEN",
-    "UNLISTEN", "NOTIFY", "IMPORT", "EXPLAIN", "SHARE", "KEY",
-})
+# THIS IS DELIBERATELY NOT A DENYLIST OF DML. Enumerating INSERT / UPDATE /
+# DELETE / MERGE would need an edit every time PostgreSQL grows a statement
+# type, and the day it grows one we do not know about is the day the hole opens.
+# Refusing EVERY *Stmt node except these two is strictly more conservative and
+# needs no maintenance. It is also what kills DML-in-CTE without this module
+# having to model CTEs at all: an InsertStmt nested six levels deep inside a
+# subquery inside a CTE is still an InsertStmt node in the tree.
+_ALLOWED_STMT_NODES = frozenset({"RawStmt", "SelectStmt"})
 
 # Read-only in name only: these reach the filesystem, open new connections that
 # are not bound by our session settings, execute a nested query string, or hold
@@ -64,8 +84,9 @@ _STATEMENT_KEYWORDS = frozenset({
 # `pg_advisory_lock` but not `pg_try_advisory_lock`, and `pg_ls_dir` but not
 # `pg_ls_logdir` / `pg_ls_waldir` / `pg_ls_tmpdir` / `pg_ls_archive_statusdir`
 # -- every one of those was reachable. Prefixes cover the whole family
-# including versions not yet released. False positives here are cheap: a column
-# named `pg_sleep_total` is refused by name, and the refusal says which name.
+# including versions not yet released. False positives here are cheap: a
+# function named `pg_sleep_total` is refused by name, and the refusal says
+# which name.
 _BLOCKED_PREFIXES = (
     "pg_read_",           # pg_read_file, pg_read_binary_file, ...
     "pg_ls_",             # pg_ls_dir, pg_ls_logdir, pg_ls_waldir, pg_ls_tmpdir, ...
@@ -108,14 +129,15 @@ _BLOCKED_PREFIXES = (
 #
 # nextval/setval are the sharpest entries here: they are ordinary-looking
 # SELECT-able functions that COMMIT A WRITE to a sequence, and they sail past
-# all three structural rules -- `SELECT nextval('s')` is a single statement with
-# a SELECT head and no statement keyword. They are the clearest evidence that
-# rules 1-3 bound the statement's SHAPE, not its effects, and that this list is
-# doing load-bearing work rather than decorating.
+# every structural rule -- `SELECT nextval('s')` is a single SelectStmt with no
+# intoClause, no locking clause and no other statement node in its tree. They
+# are the clearest evidence that the structural rules bound the statement's
+# SHAPE, not its effects, and that this list is doing load-bearing work rather
+# than decorating.
 #
-# pg_notify is the function spelling of the NOTIFY statement, which
-# _STATEMENT_KEYWORDS already denies; denying only the keyword form would have
-# been security theatre.
+# pg_notify is the function spelling of the NOTIFY statement, which the
+# statement-node rule already denies; denying only the statement form would
+# have been security theatre.
 _BLOCKED_FUNCTIONS = frozenset({
     "nextval", "setval",
     "pg_notify",
@@ -127,11 +149,13 @@ _BLOCKED_FUNCTIONS = frozenset({
     "pg_config",
 })
 
-_WORD = re.compile(r"[^\W\d][\w$]*", re.UNICODE)
-_DOLLAR_TAG = re.compile(r"\$([^\W\d]\w*)?\$", re.UNICODE)
-_NON_WORD = re.compile(r"[^\w$]", re.UNICODE)
-# Postgres ends a `--` comment at EITHER \n or \r (scan.l: non_newline [^\n\r]).
-_LINE_COMMENT_END = re.compile(r"[\n\r]")
+# For a refusal message that names the SQL the agent actually wrote.
+_LOCK_SPELLING = {
+    LockClauseStrength.LCS_FORKEYSHARE: "FOR KEY SHARE",
+    LockClauseStrength.LCS_FORSHARE: "FOR SHARE",
+    LockClauseStrength.LCS_FORNOKEYUPDATE: "FOR NO KEY UPDATE",
+    LockClauseStrength.LCS_FORUPDATE: "FOR UPDATE",
+}
 
 
 class SqlRefused(Exception):
@@ -144,222 +168,181 @@ class SqlRefused(Exception):
         self.hint = hint
 
 
-def _fold(word: str) -> str:
-    """Fold a word to the form the keyword/function rules match against.
+def _fold(name: str) -> str:
+    """Fold a parsed identifier to the form the function rules match against.
 
-    Postgres downcases unquoted identifiers with a Unicode-aware fold, so
-    `SELECТ` styled attacks and full-width or Kelvin-sign homoglyphs must
-    not slip past an ASCII-only `.upper()`. NFKC maps the compatibility
-    characters onto their ASCII equivalents; casefold then removes every case
-    distinction, including the Kelvin sign K -> k and the dotless i.
+    libpg_query has already applied Postgres's own identifier downcasing, which
+    is why this is no longer doing the heavy lifting it did when it ran over raw
+    text -- the Kelvin sign in `dblinK` arrives here already folded to `dblink`
+    by the parser itself.
+
+    It is still load-bearing for COMPATIBILITY characters, which Postgres does
+    NOT fold: `ｐｇ_ｓｌｅｅｐ` (full-width) survives the parser verbatim. NFKC
+    maps those onto their ASCII equivalents and casefold removes what case
+    distinction remains. That is deliberately MORE aggressive than the server,
+    which would likely reject the full-width name as an unknown function; the
+    guard refuses it rather than reasoning about whether some encoding or locale
+    might resolve it. Refusing costs a false positive on an identifier no honest
+    query contains.
     """
-    return unicodedata.normalize("NFKC", word).casefold()
+    return unicodedata.normalize("NFKC", name).casefold()
 
 
-def strip_literals(sql: str) -> str:
-    """Mask every comment, string literal, dollar-quoted body and quoted
-    identifier, in ONE left-to-right pass, PRESERVING LENGTH AND OFFSETS.
+def _walk(node: Any) -> Iterator[pg_ast.Node]:
+    """Yield every AST node in the tree, depth first.
 
-    A single pass is required, not sequential regex passes: `/* \' */` must be
-    recognised as a comment before the quote scanner sees it, and `\'-- \'` as a
-    literal before the comment scanner does. Anything unterminated raises --
-    ambiguity is refused, never guessed.
-
-    The output is the same length as the input and every character keeps its
-    index. That is what lets parse() find the exact offset of a trailing
-    semicolon in the MASKED text and cut the ORIGINAL text there, so the string
-    it returns provably contains no executable `;`. Masked spans become spaces,
-    except inside a quoted identifier, where word characters are kept (see
-    below) -- spaces are token separators, so blanking a literal can never fuse
-    two neighbouring tokens into one.
+    Recurses through the concrete node class's own `__slots__`, which pglast
+    generates from libpg_query's node definitions, so the traversal enumerates
+    exactly the fields the parser produces rather than a list maintained here.
+    The base class's `ancestors` slot is skipped: it is a back-reference the
+    visitor machinery populates and following it would cycle.
     """
-    out: list[str] = []
-    index = 0
-    length = len(sql)
-
-    while index < length:
-        char = sql[index]
-        start = index
-
-        if sql.startswith("--", index):
-            # A carriage return ends a line comment just like a newline does:
-            # Postgres's scanner defines non_newline as [^\n\r]. Scanning only
-            # for "\n" let `SELECT 1 --x\r; DROP TABLE t` past the one-statement
-            # rule, because everything after the CR was swallowed as comment
-            # here while the server executed it. Verified against the fixture:
-            # `SELECT 1 --x\r + 2` returns 3, not 1.
-            end = _LINE_COMMENT_END.search(sql, index)
-            index = length if end is None else end.start()
-            out.append(" " * (index - start))
-            continue
-
-        if sql.startswith("/*", index):
-            depth = 1
-            index += 2
-            while index < length and depth:
-                if sql.startswith("/*", index):
-                    depth += 1
-                    index += 2
-                elif sql.startswith("*/", index):
-                    depth -= 1
-                    index += 2
-                else:
-                    index += 1
-            if depth:
-                raise SqlRefused("parse", "unterminated block comment")
-            out.append(" " * (index - start))
-            continue
-
-        # E\'...\' escape strings: a backslash escapes a quote, unlike a standard
-        # literal under standard_conforming_strings.
-        is_estring = (
-            char in "Ee"
-            and index + 1 < length
-            and sql[index + 1] == "\'"
-            and (index == 0 or not (sql[index - 1].isalnum() or sql[index - 1] == "_"))
-        )
-        if is_estring or char == "\'":
-            index += 2 if is_estring else 1
-            closed = False
-            while index < length:
-                if is_estring and sql[index] == "\\" and index + 1 < length:
-                    index += 2
-                    continue
-                if sql[index] == "\'":
-                    if index + 1 < length and sql[index + 1] == "\'":
-                        index += 2
-                        continue
-                    index += 1
-                    closed = True
-                    break
-                index += 1
-            if not closed:
-                raise SqlRefused("parse", "unterminated string literal")
-            out.append(" " * (index - start))
-            continue
-
-        if char == '"':
-            index += 1
-            closed = False
-            while index < length:
-                if sql[index] == '"':
-                    if index + 1 < length and sql[index + 1] == '"':
-                        index += 2
-                        continue
-                    index += 1
-                    closed = True
-                    break
-                index += 1
-            if not closed:
-                raise SqlRefused("parse", "unterminated quoted identifier")
-            # NOT blanked. A quoted identifier is the one construct that would be
-            # erased from analysis while still executing as CODE: quoting a
-            # lowercase name is a no-op to Postgres, so
-            # `SELECT "pg_read_file"(\'/etc/passwd\')` resolves to exactly the
-            # function of that name -- proven executable in
-            # test_a_quoted_function_name_really_does_execute. Blanking it, or
-            # replacing it with a placeholder as the first draft did, HIDES the
-            # one thing rule 3 exists to catch.
-            #
-            # So word characters are kept and every other character -- `;`,
-            # quotes, `/*`, `--`, parens -- becomes a space. That leaves the bare
-            # NAME visible to rules 2 and 3 while neutralising anything
-            # structural the identifier could smuggle. Keywords cannot be
-            # smuggled this way in the first place (quoting strips a word\'s
-            # keyword-ness, so `AS "insert"` is a legal alias); refusing those is
-            # a false positive we accept to keep this a single rule.
-            out.append(_NON_WORD.sub(" ", sql[start:index]))
-            continue
-
-        if char == "$":
-            tag_match = _DOLLAR_TAG.match(sql, index)
-            if tag_match:
-                tag = tag_match.group(0)
-                end_at = sql.find(tag, tag_match.end())
-                if end_at == -1:
-                    raise SqlRefused("parse", "unterminated dollar-quoted string")
-                index = end_at + len(tag)
-                out.append(" " * (index - start))
+    if isinstance(node, pg_ast.Node):
+        yield node
+        for slot in type(node).__slots__:
+            if slot == "ancestors":
                 continue
+            yield from _walk(getattr(node, slot, None))
+    elif isinstance(node, (list, tuple)):
+        for item in node:
+            yield from _walk(item)
 
-        out.append(char)
-        index += 1
 
-    masked = "".join(out)
-    if len(masked) != len(sql):  # pragma: no cover -- invariant guard
-        raise SqlRefused("parse", "internal: masking changed the query length")
-    return masked
+def _refuse_blocked_function(call: pg_ast.FuncCall) -> None:
+    """Refuse a FuncCall whose name reaches the blocked list.
+
+    The name is read from the PARSE TREE, not from the query text, so every
+    spelling the parser normalises is handled for free and none of it is modelled
+    here: `"pg_read_file"(...)` (quoting a lowercase name is a no-op),
+    `pg_catalog.pg_read_file(...)` (schema qualification), and `PG_READ_FILE(...)`
+    (unquoted downcasing) all arrive as the single string 'pg_read_file'.
+
+    Every element of a qualified name is checked, not just the last. The
+    qualifier is nearly always `pg_catalog`, which matches nothing here, so this
+    costs nothing -- and it means a blocked name can never be smuggled into the
+    schema position of a call that resolves through a search_path we do not
+    control.
+    """
+    for part in call.funcname or ():
+        if not isinstance(part, pg_ast.String):
+            continue
+        name = _fold(part.sval)
+        if name in _BLOCKED_FUNCTIONS or name.startswith(_BLOCKED_PREFIXES):
+            raise SqlRefused("parse", f"function {name} is not permitted")
 
 
 def parse(query: str) -> str:
     """Refuse anything that is not exactly one read-only SELECT.
 
-    Returns the original query with a trailing semicolon removed, ready for
-    stage 2. Raises SqlRefused(stage="parse") otherwise.
+    Returns the exact original text of the statement, sliced out by the parser's
+    own offsets so it carries no trailing semicolon, ready for stage 2. Raises
+    SqlRefused(stage="parse") otherwise.
     """
     text = (query or "").strip()
     if not text:
         raise SqlRefused("parse", "empty query")
 
-    # Same length as `text`, with every literal and comment blanked, so an
-    # offset found here is the SAME offset in `text`.
-    masked = strip_literals(text)
+    # 1. It must PARSE. Anything malformed is refused, never guessed at -- and
+    #    this one branch subsumes every unterminated-literal, unterminated-
+    #    comment and unterminated-dollar-quote case the hand lexer had to
+    #    implement (and mis-implement) itself. The parser's own message is
+    #    passed through because it names and locates the offending token, which
+    #    is exactly what the agent needs to fix its own SQL.
+    try:
+        statements = parse_sql(text)
+    except ParseError as exc:
+        raise SqlRefused("parse", f"not valid SQL: {exc}") from None
 
-    # 1. Exactly one statement. A ';' inside a literal or comment is already
-    #    blanked, so any ';' left other than a single trailing one is a chain.
-    #
-    #    The cut is by OFFSET, not by `text.endswith(";")`. Those differ
-    #    whenever a comment trails the semicolon: `"SELECT 1; -- done"` does not
-    #    end with ';' after .strip(), so the first draft returned it verbatim --
-    #    handing stage 2 a string with a live ';' in it and relying on the
-    #    subquery wrap to turn that into a syntax error. Since nothing
-    #    downstream of this module is a write control, stage 1 must not emit a
-    #    chainable string at all. Cutting at the masked offset drops the
-    #    semicolon AND the trailing comment.
-    trimmed = masked.rstrip()
-    if trimmed.endswith(";"):
-        cut = len(trimmed) - 1
-        body = masked[:cut]
-        text = text[:cut].rstrip()
-    else:
-        body = masked
-    if ";" in body:
+    # 2. Exactly one statement -- a real statement count from Postgres's
+    #    grammar, not semicolon-counting on text we masked ourselves. A query
+    #    that is only comments parses to zero statements and is as empty as "".
+    if len(statements) != 1:
         raise SqlRefused(
-            "parse", "only one statement is permitted; a ';' separator was found"
+            "parse",
+            "only one statement is permitted; PostgreSQL parsed "
+            f"{len(statements)}" + (" (the query is empty or only comments)"
+                                    if not statements else ""),
         )
 
-    # 2. The statement must be a SELECT (a leading WITH is a CTE chain onto one).
-    head = _WORD.search(body)
-    keyword = head.group(0).upper() if head else ""
-    if keyword not in {"SELECT", "WITH"}:
+    raw = statements[0]
+    top = raw.stmt
+
+    # 3. That statement must be a SELECT. `CREATE TABLE x AS SELECT ...` is a
+    #    CreateTableAsStmt, not a SelectStmt, so it is refused right here.
+    if not isinstance(top, pg_ast.SelectStmt):
         raise SqlRefused(
-            "parse", f"query must begin with SELECT or WITH, got {keyword or '<nothing>'!r}"
+            "parse",
+            f"only a SELECT statement is permitted; PostgreSQL parsed this as "
+            f"{type(top).__name__}",
         )
 
-    # 3. No statement keyword and no blocked function ANYWHERE.
-    for match in _WORD.finditer(body):
-        word = match.group(0)
-        folded = _fold(word)
-        if folded.upper() in _STATEMENT_KEYWORDS:
+    # 4-6. One walk of the whole tree.
+    for node in _walk(raw):
+        kind = type(node).__name__
+
+        # 4. No statement node other than the SELECT itself, ANYWHERE. This is
+        #    what refuses DML-in-CTE, at any nesting depth, without modelling
+        #    CTEs.
+        if kind.endswith("Stmt") and kind not in _ALLOWED_STMT_NODES:
+            raise SqlRefused(
+                "parse", f"{kind} is not permitted in a read-only query"
+            )
+
+        # 5. THE TRAP. `SELECT * INTO copy_of_records FROM t` CREATES A TABLE.
+        #    It parses as an ordinary SelectStmt and contains NO statement node
+        #    other than itself, so rule 4 sails straight past it. The only thing
+        #    that distinguishes it from a plain read is a non-None intoClause.
+        #    Checked on every SelectStmt in the tree, not just the top one, so a
+        #    nested or set-operation arm cannot carry one past this.
+        if isinstance(node, pg_ast.SelectStmt) and node.intoClause is not None:
             raise SqlRefused(
                 "parse",
-                f"keyword {folded.upper()} is not permitted in a read-only query",
+                "SELECT ... INTO creates a table and is not permitted; "
+                "use a plain SELECT",
             )
-        if folded in _BLOCKED_FUNCTIONS or folded.startswith(_BLOCKED_PREFIXES):
-            raise SqlRefused("parse", f"function {folded} is not permitted")
 
-    return text
+        # 6. No row locks. FOR SHARE / FOR KEY SHARE / FOR UPDATE /
+        #    FOR NO KEY UPDATE take real locks that outlive the statement inside
+        #    a transaction and block other writers, so they are not read-only in
+        #    any useful sense.
+        if isinstance(node, pg_ast.LockingClause):
+            spelling = _LOCK_SPELLING.get(node.strength, "FOR UPDATE/SHARE")
+            raise SqlRefused(
+                "parse", f"row lock {spelling} is not permitted in a read-only query"
+            )
+
+        # 7. No blocked function, at any depth and in any spelling.
+        if isinstance(node, pg_ast.FuncCall):
+            _refuse_blocked_function(node)
+
+    # Return the statement's OWN text, cut by the parser's offsets.
+    #
+    # stmt_location is where this statement starts and stmt_len is its length,
+    # with 0 meaning "to the end of the string" for the final statement. Slicing
+    # by those offsets is what guarantees stage 2 never receives a live ';': the
+    # parser puts the statement's end BEFORE its terminator, so the semicolon and
+    # anything trailing it are outside the slice by construction rather than by a
+    # string-manipulation rule we have to get right.
+    #
+    # It also fixes a latent defect in the old cut, which keyed on
+    # `text.endswith(";")`: `"SELECT 1; -- done"` does not end with ';' after
+    # .strip(), so the semicolon survived into the returned string and stage 2's
+    # subquery wrap was left to turn it into a syntax error. Nothing downstream
+    # of this module is a write control, so stage 1 must not emit a chainable
+    # string at all.
+    start = raw.stmt_location or 0
+    end = start + raw.stmt_len if raw.stmt_len else len(text)
+    return text[start:end].strip()
 
 
 def wrap_with_limit(query: str, *, cap: int) -> str:
     """Stage 2: bound the result set.
 
     The query is WRAPPED in a subquery rather than having its LIMIT rewritten.
-    Rewriting requires understanding the query -- which LIMIT is the outer one,
-    whether it is inside a CTE or a subquery -- and the entire premise of stage
-    1 is that we never have to. Wrapping caps unconditionally: a supplied
-    LIMIT larger than the cap is overridden by the outer one, and a smaller one
-    still wins because Postgres pushes the outer limit down.
+    Rewriting requires deciding which LIMIT is the outer one and whether it is
+    inside a CTE or a subquery; wrapping caps unconditionally. A supplied LIMIT
+    larger than the cap is overridden by the outer one, and a smaller one still
+    wins because Postgres pushes the outer limit down.
 
     Newlines around the body are load-bearing: a trailing `-- comment` would
     otherwise swallow the closing parenthesis. Verified against the fixture in

@@ -7,6 +7,10 @@ dependencies = [
     "starlette>=1.3",
     "uvicorn>=0.49.0",
     "asyncpg>=0.30.0",
+    # PostgreSQL's own parser (libpg_query), not a reimplementation of it. The
+    # SQL hatch's write guard is built on the parse tree; see sql_guard.py for
+    # why a hand-written lexer was the wrong shape for that control.
+    "pglast>=8.4",
 ]
 
 [project.optional-dependencies]
