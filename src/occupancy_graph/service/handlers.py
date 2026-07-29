@@ -15,7 +15,8 @@ from occupancy_graph.service.jsonio import jsonable
 from occupancy_graph.service.limits import PREFLIGHT_ROWS
 from occupancy_graph.service.pagination import Page, page_params, paginate
 from occupancy_graph.source.bundle import AddressBundle
-from occupancy_graph.source.people import people_for_bundle
+from occupancy_graph.source.people import PERSON_ID_PREFIX, people_for_bundle
+from occupancy_graph.source.search import HAL_ID_PREFIX
 
 # The keys a person carries on the wire. `sources` is a set internally and
 # `rows` is the internal row list -- neither may leak in that form.
@@ -139,3 +140,90 @@ async def address_people(request: Request) -> JSONResponse:
         return error(400, str(exc))
     people = [_public_person(person) for person in people_for_bundle(bundle)]
     return ok(paginate(people, page, key="people"))
+
+
+def _parse_addr_person_id(person_id: str) -> tuple[int, int] | None:
+    """`addr:<addressId>:<n>` -> (address_id, index), or None if malformed."""
+    parts = person_id.split(":")
+    if len(parts) != 3:
+        return None
+    try:
+        return int(parts[1]), int(parts[2])
+    except ValueError:
+        return None
+
+
+def _malformed_person_id(person_id: str) -> JSONResponse:
+    return error(400, f"malformed person id {person_id!r}; expected addr:<n>:<n> or hal:<id>")
+
+
+async def person_records(request: Request) -> JSONResponse:
+    person_id = str(request.path_params["person_id"])
+    try:
+        page = page_params(request.query_params)
+    except ValueError as exc:
+        return error(400, str(exc))
+    shapes, unsupported = records_mod.select_shapes(request.query_params.get("shapes"))
+
+    if person_id.startswith(PERSON_ID_PREFIX):
+        return await _addr_person_records(request, person_id, page, shapes, unsupported)
+    if person_id.startswith(HAL_ID_PREFIX):
+        return error(501, "hal: traversal not implemented")   # replaced in Task 13
+    return _malformed_person_id(person_id)
+
+
+async def _addr_person_records(
+    request: Request,
+    person_id: str,
+    page: Page,
+    shapes: tuple[str, ...],
+    unsupported: list[str],
+) -> JSONResponse:
+    parsed = _parse_addr_person_id(person_id)
+    if parsed is None:
+        return _malformed_person_id(person_id)
+    address_id, index = parsed
+
+    bundle = await request.app.state.cache.get(address_id)
+    if bundle is None:
+        return error(404, f"unknown address_id {address_id}")
+    people = people_for_bundle(bundle)
+    if not 0 <= index < len(people):
+        return error(404, f"unknown person id {person_id}")
+    person = people[index]
+
+    # `rows` on a clustered person is [(shape, row)]. The row objects are the
+    # SAME dicts as bundle.rows_by_shape[shape] -- people_for_bundle iterates
+    # those already-projected lists and stores the references -- so an IDENTITY
+    # lookup recovers the bundle position that GET /v1/source-record takes.
+    # Identity, not equality: two identical rows at one address stay
+    # distinguishable. The position map is built once per shape rather than
+    # rescanned per row, which a linear `index()`-style search would make
+    # quadratic (a 200-row shape = 40 000 comparisons).
+    by_shape: dict[str, list[dict[str, Any]]] = {shape: [] for shape in shapes}
+    for shape, row in person["rows"]:
+        if shape in by_shape:
+            by_shape[shape].append(row)
+
+    blocks = {}
+    for shape in shapes:
+        # id() is safe as a key here: `full` holds a strong reference to every
+        # row for the whole lifetime of this map, so no id can be recycled.
+        positions = {id(row): i for i, row in enumerate(bundle.rows_by_shape.get(shape, []))}
+        rows = [{**row, "__rowid": positions.get(id(row))} for row in by_shape[shape]]
+        blocks[shape] = records_mod.records_block(rows, page, with_rowid=False)
+
+    return ok(
+        {
+            "person": {
+                "id": person_id,
+                "firstname": person.get("firstname"),
+                "lastname": person.get("lastname"),
+                "identity_confidence": None,
+                "is_suspicious": None,
+            },
+            "records_by_source": blocks,
+            "records_timed_out": False,
+            "unsupported_shapes": unsupported,
+        }
+    )
