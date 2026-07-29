@@ -13,7 +13,10 @@ import json
 from collections import Counter
 from dataclasses import dataclass, field
 
+import asyncpg
+
 from occupancy_graph.normalize import normalize_address, zip5
+from occupancy_graph.source import quality
 from occupancy_graph.source.feeds import FEEDS, feed_clause
 from occupancy_graph.source.pool import PartnerPool
 
@@ -136,3 +139,53 @@ async def _scan_one(
     async with pool.acquire() as conn:
         rows = await conn.fetch(sql, query.zip5, query.like_prefix, *patterns)
     return [_decode(dict(row)) for row in rows]
+
+
+@dataclass
+class TaxScanResult:
+    rows: list[dict] = field(default_factory=list)
+    dropped: int = 0
+    timed_out: bool = False
+
+
+async def scan_tax_source(
+    pool: PartnerPool, query: AddressQuery, *, city: str | None, state: str | None
+) -> TaxScanResult:
+    """Phase 2: property_owner rows via the (upper(state), upper(city)) index.
+
+    property_owner rows have `zip` and `house_number` 0% populated, so the zip
+    index cannot see them. City/state comes from the phase-1 rows.
+
+    Measured: 613 ms warm / 53 s cold. The statement timeout is the guard; on
+    expiry we report tax as absent rather than failing the investigation. The
+    engine degrades correctly on its own — case_quality_and_synthesis flips to
+    run_for_absence and the tax packets skip on their field gate.
+    """
+    if not city or not state:
+        return TaxScanResult()
+
+    clause, patterns = feed_clause("tax", start_index=4)
+    sql = f"""
+        SELECT *
+        FROM public.records_partitioned
+        WHERE upper(state) = $1
+          AND upper(city) = $2
+          AND address ILIKE $3
+          AND {clause}
+        LIMIT {MAX_ROWS_PER_SHAPE}
+    """
+    try:
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(sql, state.upper(), city.upper(), query.like_prefix, *patterns)
+    except asyncpg.QueryCanceledError:
+        return TaxScanResult(timed_out=True)
+
+    kept: list[dict] = []
+    dropped = 0
+    for row in rows:
+        decoded = _decode(dict(row))
+        if quality.tax_row_is_usable(decoded):
+            kept.append(decoded)
+        else:
+            dropped += 1
+    return TaxScanResult(rows=kept, dropped=dropped)

@@ -4,7 +4,7 @@ import pytest
 
 from occupancy_graph.source import resolve as resolve_module
 from occupancy_graph.source.pool import PartnerPool
-from occupancy_graph.source.resolve import AddressQuery, scan_zip_sources
+from occupancy_graph.source.resolve import AddressQuery, scan_tax_source, scan_zip_sources
 
 
 @pytest.fixture
@@ -138,3 +138,40 @@ async def test_scan_city_vote_tie_break_is_alphabetical_and_deterministic(monkey
     query = AddressQuery.build("123 Main St", "40505")
     results = [(await scan_zip_sources(None, query)).city for _ in range(5)]
     assert results == ["AAATOWN"] * 5
+
+
+# --- Task 13: phase-2 property_owner scan ---
+
+
+async def test_tax_scan_finds_the_property_owner_row(pool):
+    query = AddressQuery.build("123 Main St", "40505")
+    result = await scan_tax_source(pool, query, city="LEXINGTON", state="KY")
+    assert result.timed_out is False
+    ids = {row["record_id"] for row in result.rows}
+    assert 4001 in ids
+
+
+async def test_tax_scan_drops_column_shifted_rows_and_counts_them(pool):
+    query = AddressQuery.build("123 Main St", "40505")
+    result = await scan_tax_source(pool, query, city="LEXINGTON", state="KY")
+    ids = {row["record_id"] for row in result.rows}
+    assert 4003 not in ids, "column-shifted row must be dropped"
+    assert result.dropped == 1
+
+
+async def test_tax_scan_without_city_or_state_returns_empty_not_an_error(pool):
+    query = AddressQuery.build("123 Main St", "40505")
+    result = await scan_tax_source(pool, query, city=None, state=None)
+    assert result.rows == []
+    assert result.timed_out is False
+
+
+async def test_tax_scan_reports_a_timeout_instead_of_raising(fixture_db):
+    pool = await PartnerPool.create(fixture_db, statement_timeout_ms=1)
+    try:
+        query = AddressQuery.build("123 Main St", "40505")
+        result = await scan_tax_source(pool, query, city="LEXINGTON", state="KY")
+    finally:
+        await pool.close()
+    assert result.timed_out is True
+    assert result.rows == []
