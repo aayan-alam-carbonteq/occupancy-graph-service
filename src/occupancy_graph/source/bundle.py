@@ -64,6 +64,37 @@ def _split_address(norm_address: str) -> tuple[str | None, str | None, str | Non
     return match.group(1), (match.group(2) or None), match.group(3)
 
 
+def _stable_order(rows: list[dict]) -> list[dict]:
+    """Order raw partner rows by `record_id` so a bundle is reproducible.
+
+    The scans have no ORDER BY, so row order is whatever the plan happens to
+    emit -- heap order for a seq scan today, something else once the corpus is
+    large enough for the planner to pick the (upper(state), upper(city)) index.
+    That matters beyond tests: POST /v1/resolve hands the engine the FIRST N
+    rows per shape as its view of an address, so an unstable order means two
+    identical calls can show the model a different sample.
+
+    Sorted HERE, in Python, over the rows already fetched -- deliberately not as
+    an ORDER BY in the scan. The scans are `LIMIT MAX_ROWS_PER_SHAPE` with no
+    ordering, so Postgres stops as soon as it has 200 matches; that early stop
+    is why a zip + prefix match measures 173 ms. An ORDER BY applies BEFORE the
+    LIMIT, forcing every matching row in a dense ZIP to be examined and sorted
+    just to produce the top 200 -- a full sort to fix a presentation problem.
+
+    WHAT THIS DOES NOT FIX: only the ORDER of the returned rows becomes
+    deterministic, not the SELECTION. When a shape has more than
+    MAX_ROWS_PER_SHAPE matches, WHICH 200 the database hands back is still
+    arbitrary without an ORDER BY. Two identical calls can therefore still see
+    different rows -- they will merely see them in a stable order.
+
+    Raw rows, not projected dicts: `record_id` is guaranteed on the partner row,
+    whereas the projected dict carries only what the shape's manifest maps (the
+    utility shape, for one, maps no id at all). A NULL record_id sorts last
+    rather than raising on a None/int comparison.
+    """
+    return sorted(rows, key=lambda row: (row.get("record_id") is None, row.get("record_id")))
+
+
 async def materialize(
     pool: PartnerPool, address: str, zip_code: str | None, *, address_id: int
 ) -> AddressBundle:
@@ -74,9 +105,11 @@ async def materialize(
     rows_by_shape: dict[str, list[dict]] = {}
     dropped: dict[str, int] = {}
     for shape, rows in zip_scan.rows_by_shape.items():
-        rows_by_shape[shape] = [project_row(SHAPES[shape], row) for row in rows]
+        rows_by_shape[shape] = [project_row(SHAPES[shape], row) for row in _stable_order(rows)]
         dropped[shape] = 0
-    rows_by_shape["tax"] = [project_row(SHAPES["tax"], row) for row in tax_scan.rows]
+    rows_by_shape["tax"] = [
+        project_row(SHAPES["tax"], row) for row in _stable_order(tax_scan.rows)
+    ]
     dropped["tax"] = tax_scan.dropped
 
     street_number, street_name, unit = _split_address(query.norm_address)

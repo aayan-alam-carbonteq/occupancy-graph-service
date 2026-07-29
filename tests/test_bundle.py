@@ -43,6 +43,83 @@ async def test_bundle_carries_the_resolved_address(pool):
     assert bundle.street_number == "123"
 
 
+def _utility_row(record_id: int, first_name: str) -> dict:
+    return {
+        "record_id": record_id, "first_name": first_name, "last_name": "Tenant",
+        "address": "123 MAIN ST", "city": "LEXINGTON", "county": "FAYETTE",
+        "state": "KY", "zip": "40505",
+    }
+
+
+def _tax_row(record_id: int | None, owner: str) -> dict:
+    return {
+        "record_id": record_id, "address": "123 MAIN ST", "city": "LEXINGTON",
+        "state": "KY", "raw_data": {"ownerName": owner},
+    }
+
+
+def _patch_scans(monkeypatch, utility_rows: list[dict], tax_rows: list[dict]) -> None:
+    """Drive materialize with scan results handed back in a chosen order.
+
+    The real scans have no ORDER BY, so on the fixture they happen to emit heap
+    order, which already equals record_id order -- a test against the real scan
+    would pass with the sort deleted. Feeding a deliberately scrambled order is
+    what makes the assertion actually load-bearing.
+    """
+    from occupancy_graph.source.resolve import TaxScanResult, ZipScanResult
+
+    async def fake_zip_scan(_pool, _query):
+        empty = {shape: [] for shape in ("trace", "base", "loan", "drive", "auto")}
+        return ZipScanResult(
+            rows_by_shape={"utility": list(utility_rows), **empty},
+            city="LEXINGTON", state="KY",
+        )
+
+    async def fake_tax_scan(_pool, _query, *, city, state):
+        return TaxScanResult(
+            rows=list(tax_rows), dropped=0, queried_city=city, queried_state=state
+        )
+
+    monkeypatch.setattr(bundle_module, "scan_zip_sources", fake_zip_scan)
+    monkeypatch.setattr(bundle_module, "scan_tax_source", fake_tax_scan)
+
+
+async def test_materialize_orders_rows_by_record_id_whatever_order_the_scan_returned(
+    pool, monkeypatch
+):
+    """POST /v1/resolve shows the engine the FIRST N rows per shape, so the
+    order the plan happens to emit must not leak into the response."""
+    _patch_scans(
+        monkeypatch,
+        utility_rows=[
+            _utility_row(1003, "Third"), _utility_row(1001, "First"), _utility_row(1002, "Second")
+        ],
+        tax_rows=[_tax_row(4002, "SECOND OWNER"), _tax_row(4001, "FIRST OWNER")],
+    )
+    bundle = await materialize(pool, "123 Main St", "40505", address_id=1)
+
+    assert [row["first_name"] for row in bundle.rows_by_shape["utility"]] == [
+        "First", "Second", "Third"
+    ]
+    assert [row["ownername"] for row in bundle.rows_by_shape["tax"]] == [
+        "FIRST OWNER", "SECOND OWNER"
+    ]
+
+
+async def test_materialize_sorts_a_null_record_id_last_rather_than_raising(pool, monkeypatch):
+    """record_id has no NOT NULL constraint. A None mixed with ints would raise
+    TypeError on comparison and take the whole investigation down."""
+    _patch_scans(
+        monkeypatch,
+        utility_rows=[_utility_row(None, "NoId"), _utility_row(1001, "First")],
+        tax_rows=[_tax_row(None, "NO ID"), _tax_row(None, "ALSO NO ID")],
+    )
+    bundle = await materialize(pool, "123 Main St", "40505", address_id=1)
+
+    assert [row["first_name"] for row in bundle.rows_by_shape["utility"]] == ["First", "NoId"]
+    assert len(bundle.rows_by_shape["tax"]) == 2
+
+
 async def test_cache_returns_the_same_bundle_without_rescanning(pool):
     cache = BundleCache(pool)
     first = await cache.resolve("123 Main St", "40505")

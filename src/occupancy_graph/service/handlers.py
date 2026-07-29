@@ -59,7 +59,20 @@ async def resolve_address(request: Request) -> JSONResponse:
     if not isinstance(body, dict) or not str(body.get("address") or "").strip():
         return error(400, "address is required")
 
-    rows = int(body.get("rows") or PREFLIGHT_ROWS)
+    # Two different failure modes, deliberately handled differently. A value we
+    # cannot parse is a client bug and is REFUSED by name -- `int("abc")` here
+    # used to escape the try above and surface as a 500, which is exactly what
+    # the sibling test names. An out-of-range integer is a coherent preference
+    # ("as few as possible"), so it is CLAMPED, not refused.
+    raw_rows = body.get("rows")
+    if raw_rows is None:
+        rows = PREFLIGHT_ROWS
+    else:
+        try:
+            rows = int(raw_rows)
+        except (TypeError, ValueError):
+            return error(400, "rows must be an integer")
+
     bundle = await request.app.state.cache.resolve(body["address"], body.get("zip"))
     resolved = bundle.relation_count > 0
     page = Page(limit=max(1, rows), offset=0)

@@ -72,6 +72,42 @@ async def test_a_missing_address_is_a_400_not_a_500(client):
     assert (await client.post("/v1/resolve", content=b"not json")).status_code == 400
 
 
+async def test_an_unparseable_rows_value_is_a_400_naming_rows(client):
+    response = await client.post(
+        "/v1/resolve", json={"address": "123 Main St", "zip": "40505", "rows": "abc"}
+    )
+    assert response.status_code == 400
+    assert "rows" in response.json()["error"]
+
+
+async def test_an_out_of_range_rows_value_is_clamped_rather_than_refused(client):
+    """Deliberately asymmetric with the test above: garbage is REFUSED, but an
+    integer out of range is a coherent ask ("as few as possible") and is
+    CLAMPED to one row. total_count still reports the full result."""
+    body = (await client.post(
+        "/v1/resolve", json={"address": "123 Main St", "zip": "40505", "rows": 0}
+    )).json()
+    tax = body["records_by_source"]["tax"]
+    assert tax["total_count"] == 2
+    assert len(tax["records"]) == 1
+    assert tax["has_more"] is True
+
+    negative = (await client.post(
+        "/v1/resolve", json={"address": "123 Main St", "zip": "40505", "rows": -5}
+    )).json()
+    assert len(negative["records_by_source"]["tax"]["records"]) == 1
+
+
+async def test_tax_records_come_back_in_record_id_order(client):
+    """The order contract POST /v1/resolve owes the engine. The scan has no
+    ORDER BY; source.bundle sorts by record_id after fetching. 4001 (DOE)
+    precedes 4002 (ACME) regardless of what the plan emitted."""
+    body = (await client.post("/v1/resolve", json={"address": "123 Main St", "zip": "40505"})).json()
+    assert [row["ownername"] for row in body["records_by_source"]["tax"]["records"]] == [
+        "DOE, JANE ANN", "ACME HOLDINGS LLC"
+    ]
+
+
 async def test_getting_the_resolve_route_returns_405_json(client):
     # Relocated from tests/test_app.py: the plan asserted this one task early,
     # when /v1/resolve was not yet routed and Starlette answered 404. Now that
@@ -81,3 +117,7 @@ async def test_getting_the_resolve_route_returns_405_json(client):
     assert response.status_code == 405
     assert response.headers["content-type"].startswith("application/json")
     assert "error" in response.json()
+    # RFC 9110 requires Allow on a 405 so a client can discover the right
+    # method. The router attaches it to the HTTPException; the JSON error
+    # handler must forward it rather than build a bare response.
+    assert "POST" in response.headers["allow"]

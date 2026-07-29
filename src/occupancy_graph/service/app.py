@@ -25,8 +25,15 @@ from occupancy_graph.source.pool import PartnerPool
 
 async def _http_exception(request: Request, exc: HTTPException) -> JSONResponse:
     """Starlette's default 404/405 body is plain text. The engine parses JSON
-    unconditionally, so every error on this service is a JSON object."""
-    return JSONResponse({"error": exc.detail}, status_code=exc.status_code)
+    unconditionally, so every error on this service is a JSON object.
+
+    `exc.headers` must be forwarded, not dropped: the router attaches
+    `Allow` to the 405 it raises, and RFC 9110 requires that header on a 405 so
+    a client can discover the method it should have used.
+    """
+    return JSONResponse(
+        {"error": exc.detail}, status_code=exc.status_code, headers=exc.headers
+    )
 
 
 def create_app(*, pool: PartnerPool | None = None, cache: BundleCache | None = None) -> Starlette:
