@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Mapping, Sequence
-from typing import Any
+from typing import Any, NamedTuple
 
 import asyncpg
 
@@ -25,16 +25,32 @@ logger = logging.getLogger(__name__)
 
 HAL_ID_PREFIX = "hal:"
 
+
+class _PhysicalTable(NamedTuple):
+    """relation: the qualified name interpolated into the query. It is a literal
+    defined in this module -- never a caller-supplied string -- so the f-string
+    below cannot be reached by partner text.
+
+    storage_family: which underlying corpus the relation reads. `record_id` is
+    unique only WITHIN a family, so it is the (family, record_id) pair that
+    identifies a physical row. records_new is a view over records_partitioned,
+    so both name the same family; records_legacy is a separate corpus that can
+    hold an unrelated row with the same record_id.
+    """
+
+    relation: str
+    storage_family: str
+
+
 # entity_links.source_table is partner-supplied text. It is validated against
 # this map and NEVER interpolated unchecked -- it reaches a SQL identifier
-# position, where a bind parameter cannot be used. Note that what lands in the
-# f-string is the mapping's VALUE (a literal defined here), not the caller's
-# string, so even a str subclass that games the membership test cannot reach
-# the query text.
+# position, where a bind parameter cannot be used. What lands in the f-string is
+# the mapping's VALUE (a literal defined here), not the caller's string, so even
+# a str subclass that games the membership test cannot reach the query text.
 PHYSICAL_TABLES = {
-    "records_legacy": "public.records_legacy",
-    "records_new": "public.records_new",
-    "records_partitioned": "public.records_partitioned",
+    "records_legacy": _PhysicalTable("public.records_legacy", "legacy"),
+    "records_new": _PhysicalTable("public.records_new", "partitioned"),
+    "records_partitioned": _PhysicalTable("public.records_partitioned", "partitioned"),
 }
 
 # Ceiling on links followed per person. 200 rows of one shape is already the
@@ -163,6 +179,14 @@ async def rows_for_links(
     Degradation is all-or-nothing on purpose: a cancellation on the second
     physical table discards what the first already returned, because a partial
     set carries no marker distinguishing it from a complete one downstream.
+
+    Results are deduplicated on (storage_family, record_id). records_new is a
+    view over records_partitioned, so entity_links can name ONE physical row
+    under two source_table values; returning it twice would not raise, it would
+    inflate a per-person record count that feeds a downstream score. The dedup
+    runs over the accumulated RESULTS rather than by merging the two into one
+    query, because merging would assume the partner's view is an unfiltered
+    passthrough -- true of the fixture, unverifiable against production.
     """
     by_table: dict[str, list[int]] = {}
     for link in links:
@@ -175,13 +199,32 @@ async def rows_for_links(
         by_table.setdefault(table, []).append(int(link["record_id"]))
 
     fetched: list[dict[str, Any]] = []
+    # (storage_family, record_id) -> the source_table whose copy we kept.
+    seen: dict[tuple[str, Any], str] = {}
     for table, record_ids in by_table.items():
-        sql = f"SELECT * FROM {PHYSICAL_TABLES[table]} WHERE record_id = ANY($1::bigint[])"
+        physical = PHYSICAL_TABLES[table]
+        sql = f"SELECT * FROM {physical.relation} WHERE record_id = ANY($1::bigint[])"
         try:
             async with pool.acquire() as conn:
                 rows = await conn.fetch(sql, record_ids)
         except asyncpg.QueryCanceledError as exc:
             logger.warning("entity row fetch cancelled on %s: %s", table, exc)
             return [], True
-        fetched.extend(decode_raw_data(dict(row)) for row in rows)
+        for row in rows:
+            decoded = decode_raw_data(dict(row))
+            key = (physical.storage_family, decoded["record_id"])
+            kept_from = seen.get(key)
+            if kept_from is not None:
+                # Not merely noise-suppression: this firing in production is the
+                # only way we learn the partner emits both link kinds for one
+                # row, which nothing in the corpus currently tells us.
+                logger.warning(
+                    "entity_links names record_id %s under both %r and %r; these "
+                    "resolve to the same physical row (storage family %r) and the "
+                    "duplicate is dropped",
+                    decoded["record_id"], kept_from, table, physical.storage_family,
+                )
+                continue
+            seen[key] = table
+            fetched.append(decoded)
     return fetched, False

@@ -8,6 +8,7 @@ and is_suspicious so the model can discount it.
 """
 from __future__ import annotations
 
+import logging
 from contextlib import asynccontextmanager
 
 import asyncpg
@@ -107,9 +108,21 @@ async def test_an_unknown_source_table_is_refused_not_interpolated(pool):
 
 
 async def test_rows_for_links_reports_a_timeout_instead_of_raising(fixture_db):
-    """record_id is not indexed on the partner records tables, so this lookup is
-    the one place the typed surface can blow its budget. A 1 ms statement
-    timeout forces the degradation path production would take."""
+    """SMOKE TEST -- NOT the timeout guarantee. Read this before trusting it.
+
+    Its value is that it is the only test driving a genuine Postgres
+    QueryCanceledError through asyncpg rather than a hand-rolled double, which
+    has caught real bugs. But the `if timed_out:` guard means that on a fast
+    machine, or once records_*(record_id) is indexed, it may assert NOTHING: the
+    fixture tables hold ~20 rows and a 1 ms statement_timeout is a race, not a
+    guarantee. (Measured 20/20 cancellations on the dev box -- still a race.)
+    It also cannot catch a partial-leak regression, since a single table has no
+    earlier rows to leak.
+
+    The deterministic coverage of the ([], True) contract lives in
+    test_a_cancelled_row_fetch_degrades_to_empty_rather_than_raising and
+    test_a_timeout_on_the_second_table_does_not_leak_the_first_tables_rows.
+    """
     tiny = await PartnerPool.create(fixture_db, statement_timeout_ms=1)
     try:
         links = [{"source_table": "records_legacy", "record_id": n} for n in range(1000, 1200)]
@@ -184,3 +197,56 @@ async def test_a_timeout_on_the_second_table_does_not_leak_the_first_tables_rows
     assert len(pool.calls) == 2
     assert "records_legacy" in pool.calls[0][0]
     assert "records_new" in pool.calls[1][0]
+
+
+# --- One physical row reached two ways --------------------------------------
+#
+# schema.sql:66 makes records_new an unfiltered view over records_partitioned,
+# so entity_links can name a single physical row under two source_table values.
+# The fixture's own links only use records_legacy and records_new, so the
+# collision has to be injected.
+
+
+async def test_the_same_physical_row_reached_through_the_view_and_its_base_table_is_returned_once(
+    caplog,
+):
+    """A doubled row does not raise -- it inflates a per-person record count
+    that feeds a downstream score, which is the same class of silent-wrong as
+    an empty result read as "no records"."""
+    row = {"record_id": 2001, "raw_data": '{"loan_amount": "500"}'}
+    pool = _ScriptedPool([[dict(row)], [dict(row)]])
+    with caplog.at_level(logging.WARNING, logger="occupancy_graph.source.search"):
+        rows, timed_out = await search.rows_for_links(pool, [
+            {"source_table": "records_new", "record_id": 2001},
+            {"source_table": "records_partitioned", "record_id": 2001},
+        ])
+    assert timed_out is False
+    assert [r["record_id"] for r in rows] == [2001]
+    # First occurrence wins, and raw_data is still decoded on the kept copy.
+    assert rows[0]["raw_data"]["loan_amount"] == "500"
+    # Each relation was queried separately: the dedup is over the RESULTS, not a
+    # merged query bucket that would assume the view is an unfiltered passthrough.
+    assert len(pool.calls) == 2
+    assert "public.records_new" in pool.calls[0][0]
+    assert "public.records_partitioned" in pool.calls[1][0]
+    # The drop must be observable -- an inert guard teaches us nothing about
+    # whether the partner really emits both link kinds for one row.
+    assert "records_new" in caplog.text and "records_partitioned" in caplog.text
+    assert "2001" in caplog.text
+
+
+async def test_the_same_record_id_in_a_different_storage_family_is_not_deduped():
+    """record_id is unique only WITHIN a corpus. records_legacy is a separate
+    corpus from the partitioned tables and can hold an unrelated row with the
+    same record_id, so deduping on record_id alone would silently drop a real
+    record -- the same failure it is meant to prevent, pointed the other way."""
+    pool = _ScriptedPool([
+        [{"record_id": 1002, "raw_data": "{}"}],
+        [{"record_id": 1002, "raw_data": "{}"}],
+    ])
+    rows, timed_out = await search.rows_for_links(pool, [
+        {"source_table": "records_legacy", "record_id": 1002},
+        {"source_table": "records_new", "record_id": 1002},
+    ])
+    assert timed_out is False
+    assert [r["record_id"] for r in rows] == [1002, 1002]
