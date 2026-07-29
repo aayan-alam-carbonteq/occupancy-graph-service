@@ -60,6 +60,10 @@ def create_app(*, pool: PartnerPool | None = None, cache: BundleCache | None = N
         Route("/v1/resolve", handlers.resolve_address, methods=["POST"]),
         Route("/v1/address/{address_id:int}/records", handlers.address_records, methods=["GET"]),
         Route("/v1/address/{address_id:int}/people", handlers.address_people, methods=["GET"]),
+        # Before /v1/person/... . The prefixes are distinct (`people` vs
+        # `person`) so neither can shadow the other, but the literal route is
+        # kept ahead of the parameterised one so the read order is obvious.
+        Route("/v1/people/search", handlers.people_search, methods=["GET"]),
         Route("/v1/person/{person_id}/records", handlers.person_records, methods=["GET"]),
     ]
     app = Starlette(

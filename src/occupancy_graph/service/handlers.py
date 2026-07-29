@@ -12,7 +12,7 @@ from starlette.responses import JSONResponse
 
 from occupancy_graph.service import records as records_mod
 from occupancy_graph.service.jsonio import jsonable
-from occupancy_graph.service.limits import PREFLIGHT_ROWS
+from occupancy_graph.service.limits import DEFAULT_PAGE_LIMIT, PREFLIGHT_ROWS
 from occupancy_graph.service.pagination import Page, page_params, paginate
 from occupancy_graph.source import quality, search
 from occupancy_graph.source.bundle import AddressBundle
@@ -301,5 +301,49 @@ async def _hal_person_records(
             # actually means "the lookup ran out of time".
             "records_timed_out": timed_out,
             "unsupported_shapes": unsupported,
+        }
+    )
+
+
+def _search_result(entity: dict[str, Any]) -> dict[str, Any]:
+    first = entity["canonical_first_name"] or ""
+    last = entity["canonical_last_name"] or ""
+    return {
+        "id": f"{HAL_ID_PREFIX}{entity['hal_id']}",
+        "firstname": entity["canonical_first_name"],
+        "lastname": entity["canonical_last_name"],
+        "full_name": " ".join(part for part in (first, last) if part) or None,
+        "match_score": entity["match_score"],
+        # entity_master's own column, NOT a count of entity_links rows. The two
+        # disagree in the partner corpus; this is the partner's number.
+        "record_count": entity["record_count"],
+        "identity_confidence": entity["identity_confidence"],
+        "is_suspicious": entity["is_suspicious"],
+        "address_line1": entity["canonical_address_line1"],
+        "city": entity["canonical_city"],
+        "state": entity["canonical_state"],
+        "zip": entity["canonical_zip"],
+    }
+
+
+async def people_search(request: Request) -> JSONResponse:
+    name = request.query_params.get("name") or ""
+    if not name.strip():
+        return error(400, "name is required")
+    try:
+        page = page_params(request.query_params, default_limit=DEFAULT_PAGE_LIMIT)
+    except ValueError as exc:
+        return error(400, str(exc))
+
+    total, entities = await search.search_people(request.app.state.pool, name, limit=page.limit)
+    results = [_search_result(entity) for entity in entities]
+    return ok(
+        {
+            # `total` is count(*) OVER () from the query -- the TRUE match count,
+            # evaluated before LIMIT. has_more is therefore a real statement
+            # about the corpus, not about the page we happen to have built.
+            "total_count": total,
+            "has_more": len(results) < total,
+            "results": results,
         }
     )
