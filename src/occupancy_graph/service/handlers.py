@@ -13,7 +13,7 @@ from starlette.responses import JSONResponse
 from occupancy_graph.service import records as records_mod
 from occupancy_graph.service.jsonio import jsonable
 from occupancy_graph.service.limits import PREFLIGHT_ROWS
-from occupancy_graph.service.pagination import Page
+from occupancy_graph.service.pagination import Page, page_params
 from occupancy_graph.source.bundle import AddressBundle
 
 
@@ -89,5 +89,26 @@ async def resolve_address(request: Request) -> JSONResponse:
                 shape: records_mod.records_block(bundle.rows_by_shape.get(shape, []), page)
                 for shape in records_mod.ALL_SHAPES
             },
+        }
+    )
+
+
+async def address_records(request: Request) -> JSONResponse:
+    address_id = int(request.path_params["address_id"])
+    bundle = await request.app.state.cache.get(address_id)
+    if bundle is None:
+        return error(404, f"unknown address_id {address_id}")
+    try:
+        page = page_params(request.query_params)
+    except ValueError as exc:
+        return error(400, str(exc))
+    shapes, unsupported = records_mod.select_shapes(request.query_params.get("shapes"))
+    return ok(
+        {
+            "records_by_source": {
+                shape: records_mod.records_block(bundle.rows_by_shape.get(shape, []), page)
+                for shape in shapes
+            },
+            "unsupported_shapes": unsupported,
         }
     )

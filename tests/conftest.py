@@ -61,13 +61,24 @@ async def service_pool(fixture_db: str):
 
 
 @pytest_asyncio.fixture(loop_scope="session")
-async def client(service_pool):
+async def service_cache(service_pool) -> BundleCache:
+    """The BundleCache the `client` app is built on.
+
+    Its own fixture rather than an inline argument to create_app, so a test that
+    needs to drive the cache's tiers (evict_hot, and the hot-miss/cold-hit
+    re-materialization behind it) can request it directly instead of reaching
+    through httpx's private transport for the object the app was handed."""
+    return BundleCache(service_pool)
+
+
+@pytest_asyncio.fixture(loop_scope="session")
+async def client(service_pool, service_cache):
     """The ASGI app driven in-process. httpx.ASGITransport does NOT run the
     lifespan, which is exactly what we want: the pool and cache are injected,
     so no test needs PARTNER_DSN."""
     from occupancy_graph.service.app import create_app
 
-    app = create_app(pool=service_pool, cache=BundleCache(service_pool))
+    app = create_app(pool=service_pool, cache=service_cache)
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://graph.test") as http:
         yield http
