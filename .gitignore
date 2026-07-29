@@ -3,6 +3,5 @@ __pycache__/
 .venv/
 data/
 *.sqlite
-schema.graphql.tmp
 *.egg-info/
 .env
