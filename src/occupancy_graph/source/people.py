@@ -31,6 +31,12 @@ def people_for_bundle(bundle) -> list[dict[str, Any]]:
     clusters: dict[str, dict[str, Any]] = {}
     for shape in _NAME_SHAPES:
         for row in bundle.rows_by_shape.get(shape, []):
+            # A company/trust owner is not a resident. The engine classifies a
+            # person whose name tokens are a subset of the owner's as `owner`,
+            # so surfacing "ACME" here would manufacture owner-presence at a
+            # property whose owner mails elsewhere — inverting the core signal.
+            if shape == "tax" and (row.get("ownercompany") or "").strip():
+                continue
             key = row.get("__norm_name_key") or ""
             if not key or key == "|":
                 continue

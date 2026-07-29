@@ -48,3 +48,10 @@ def test_rows_without_a_name_are_skipped(bundle):
 
 def test_person_carries_the_bundle_address_as_primary(bundle):
     assert all(p["primary_address_id"] == 7 for p in people_for_bundle(bundle))
+
+
+def test_company_owners_do_not_surface_as_people_at_the_address(bundle):
+    people = people_for_bundle(bundle)
+    assert all(p["lastname"] != "ACME" for p in people)
+    jane = next(p for p in people if p["norm_name_key"] == "jane|doe")
+    assert "tax" in jane["sources"]
