@@ -8,13 +8,17 @@ can adapt rather than guess.
 from __future__ import annotations
 
 import json
+import time
 from collections.abc import Iterator
+from dataclasses import dataclass
 from typing import Any
 
 import asyncpg
 
+from occupancy_graph.service import limits
+from occupancy_graph.service.jsonio import jsonable
 from occupancy_graph.service.limits import is_records_relation
-from occupancy_graph.service.sql_guard import SqlRefused
+from occupancy_graph.service.sql_guard import SqlRefused, parse, wrap_with_limit
 from occupancy_graph.source.pool import PartnerPool
 
 # Anything exposing `acquire()` as an async context manager yielding an asyncpg
@@ -111,3 +115,134 @@ def check_plan(
             HINT,
         )
     return total
+
+
+@dataclass(frozen=True)
+class SqlResult:
+    columns: list[str]
+    rows: list[list[Any]]
+    row_count: int
+    truncated: bool
+    plan_cost: float
+    duration_ms: int
+
+    def as_payload(self) -> dict[str, Any]:
+        return {
+            "columns": self.columns,
+            "rows": self.rows,
+            "row_count": self.row_count,
+            "truncated": self.truncated,
+            "plan_cost": self.plan_cost,
+            "duration_ms": self.duration_ms,
+        }
+
+
+def _cap_for(max_rows: int | None) -> int:
+    """The row cap for one hatch call.
+
+    `None` means "no preference" and takes the service default. Anything else is
+    CLAMPED into [1, max_sql_rows], never refused -- an out-of-range integer is a
+    coherent preference ("as few as possible", "as many as you have"), and this
+    matches POST /v1/resolve's `rows`, which clamps with `max(1, rows)`. The two
+    endpoints must not disagree about what an out-of-range number means.
+
+    A value that is not a number at all is a different failure and is NOT handled
+    here: `int()` raises, and the HTTP handler turns that into a 400 naming the
+    parameter. That split is deliberate -- the identical bug in /v1/resolve's
+    `rows` (an `int()` outside every try) surfaced as a 500.
+    """
+    if max_rows is None:
+        return limits.max_sql_rows()
+    return max(1, min(int(max_rows), limits.max_sql_rows()))
+
+
+async def run_query(
+    pool: ConnectionSource, query: str, *, max_rows: int | None = None
+) -> SqlResult:
+    """The four stages, in order. Any of them may raise SqlRefused.
+
+    1. parse   -- exactly one SELECT (the write guard)
+    2. wrap    -- bound the result set
+    3. explain -- refuse an unservable plan
+    4. execute -- READ ONLY transaction, statement timeout, row cap
+    """
+    cleaned = parse(query)
+
+    cap = _cap_for(max_rows)
+    # cap + 1 so a result exactly `cap` long is distinguishable from a truncated
+    # one, rather than always reporting truncated=true at the boundary.
+    wrapped = wrap_with_limit(cleaned, cap=cap + 1)
+
+    plan = await explain_plan(pool, wrapped)
+    plan_cost = check_plan(
+        plan,
+        max_plan_cost=limits.max_plan_cost(),
+        max_records_seqscan_cost=limits.max_records_seqscan_cost(),
+    )
+
+    started = time.monotonic()
+    try:
+        async with pool.acquire() as conn:
+            # Explicit READ ONLY behind the parse guard. The guard is the
+            # control; this is what remains true even if the guard were wrong.
+            #
+            # It is NOT redundant with the pool's `default_transaction_read_only`
+            # server setting, even though that setting alone would make
+            # `transaction_read_only` read `on` here. The pool is an argument:
+            # run_query serves whatever pool it is handed, and this qualifier is
+            # the only thing that makes the transaction read-only when the pool
+            # has no such default. Pinned by
+            # test_stage_four_opens_the_transaction_read_only_itself, which
+            # drives exactly that pool.
+            async with conn.transaction(readonly=True):
+                # SET LOCAL, so it is scoped to this transaction and reverts on
+                # commit. It OVERRIDES the connection's startup-packet
+                # statement_timeout for the duration, which is the point: the
+                # hatch's budget for agent-authored SQL is its own knob
+                # (SQL_HATCH_TIMEOUT_MS), not the pool's typed-query budget.
+                # `SET LOCAL` requires a transaction, and there is one.
+                #
+                # LOCAL is NOT observable today and is still the right form. A
+                # plain session `SET` would behave identically here -- nothing
+                # else runs on this connection before it is released, and asyncpg
+                # issues `RESET ALL` on every release (Connection.get_reset_query),
+                # which restores the startup-packet value. That equivalence is
+                # exactly the trap: it makes the session form's correctness
+                # depend on asyncpg's release behaviour, and source/pool.py's
+                # docstring records the Critical this codebase already shipped by
+                # depending on that same mechanism from the other direction --
+                # `RESET ALL` silently wiped the safety settings an `init=`
+                # callback had SET, leaving the corpus unbounded from the second
+                # acquire onward. LOCAL reverts by its own definition instead.
+                # A mutation swapping LOCAL out therefore SURVIVES the suite;
+                # it is an equivalent mutant, recorded here rather than papered
+                # over with a test that only asserts asyncpg's internals.
+                await conn.execute(f"SET LOCAL statement_timeout = {limits.sql_timeout_ms()}")
+                statement = await conn.prepare(wrapped)
+                # prepare() gives the column list even when zero rows come back.
+                columns = [attr.name for attr in statement.get_attributes()]
+                fetched = await statement.fetch()
+    except asyncpg.QueryCanceledError as exc:
+        raise SqlRefused(
+            "explain",
+            f"query exceeded the {limits.sql_timeout_ms()} ms statement timeout: {exc}",
+            HINT,
+        ) from exc
+    except asyncpg.PostgresError as exc:
+        raise SqlRefused("explain", str(exc), HINT) from exc
+    duration_ms = int(round((time.monotonic() - started) * 1000))
+
+    truncated = len(fetched) > cap
+    window = fetched[:cap]
+    return SqlResult(
+        columns=columns,
+        # `for value in record` iterates an asyncpg Record's VALUES, so jsonable()
+        # never receives a Record whole -- which matters because it has no Record
+        # branch and would fall through to str(), emitting the useless
+        # "<Record a=1>". Pinned by test_non_json_types_survive_the_round_trip.
+        rows=[[jsonable(value) for value in record] for record in window],
+        row_count=len(window),
+        truncated=truncated,
+        plan_cost=plan_cost,
+        duration_ms=duration_ms,
+    )

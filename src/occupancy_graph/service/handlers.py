@@ -11,9 +11,11 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 
 from occupancy_graph.service import records as records_mod
+from occupancy_graph.service import sql_hatch
 from occupancy_graph.service.jsonio import jsonable
 from occupancy_graph.service.limits import DEFAULT_PAGE_LIMIT, PREFLIGHT_ROWS
 from occupancy_graph.service.pagination import Page, page_params, paginate
+from occupancy_graph.service.sql_guard import SqlRefused
 from occupancy_graph.source import quality, search
 from occupancy_graph.source.bundle import AddressBundle
 from occupancy_graph.source.feeds import shapes_for_row
@@ -391,3 +393,50 @@ async def source_record(request: Request) -> JSONResponse:
             "data": dict(row),
         }
     )
+
+
+async def run_sql(request: Request) -> JSONResponse:
+    """The SQL hatch. Four guarded stages; a refusal is a 422, not a 500.
+
+    The refusal body is the agent's whole feedback loop, so it carries `stage`
+    (which control fired) and `hint` (what the corpus can actually serve)
+    alongside `reason`, rather than a bare message.
+    """
+    try:
+        # json.JSONDecodeError subclasses ValueError, so this covers a malformed
+        # body as well as a non-JSON one.
+        body = await request.json()
+    except ValueError:
+        return error(400, "request body must be JSON")
+    if not isinstance(body, dict) or not str(body.get("query") or "").strip():
+        return error(400, "query is required")
+
+    # The same split resolve_address applies to `rows`, and for the same reason:
+    # `int(max_rows)` inline in the call below would sit outside every try, so
+    # {"max_rows": "abc"} would surface as a 500. A value we cannot parse is a
+    # client bug and is REFUSED BY NAME; an out-of-range integer is a coherent
+    # preference and is CLAMPED downstream in sql_hatch._cap_for.
+    raw_max_rows = body.get("max_rows")
+    if raw_max_rows is None:
+        max_rows = None
+    else:
+        try:
+            max_rows = int(raw_max_rows)
+        except (TypeError, ValueError):
+            return error(400, "max_rows must be an integer")
+
+    try:
+        result = await sql_hatch.run_query(
+            request.app.state.pool, body["query"], max_rows=max_rows
+        )
+    except SqlRefused as refusal:
+        return JSONResponse(
+            {
+                "refused": True,
+                "stage": refusal.stage,
+                "reason": refusal.reason,
+                "hint": refusal.hint,
+            },
+            status_code=422,
+        )
+    return ok(result.as_payload())

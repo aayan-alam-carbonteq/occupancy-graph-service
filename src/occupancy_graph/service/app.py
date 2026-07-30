@@ -66,6 +66,7 @@ def create_app(*, pool: PartnerPool | None = None, cache: BundleCache | None = N
         Route("/v1/people/search", handlers.people_search, methods=["GET"]),
         Route("/v1/person/{person_id}/records", handlers.person_records, methods=["GET"]),
         Route("/v1/source-record/{shape}/{rowid:int}", handlers.source_record, methods=["GET"]),
+        Route("/v1/sql", handlers.run_sql, methods=["POST"]),
     ]
     app = Starlette(
         routes=routes,
