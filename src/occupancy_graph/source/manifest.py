@@ -1,19 +1,18 @@
-"""The shape manifest — the single source of truth for the GraphQL contract.
+"""The shape manifest — the single source of truth for the record contract.
 
 Each shape lists its fields IN CONTRACT ORDER, mapping the raw column name (the
-key the consuming engine reads out of SourceRecord.data) to where the value comes
+key the consuming engine reads out of a record's `data`) to where the value comes
 from in the partner corpus.
 
 Two rules that are easy to get wrong:
 
-1. Keys here are RAW column names, not GraphQL field names. Strawberry camelCases
-   them (`first_name` -> `firstName`, `dob_day` -> `dobDay`). The engine reads the
-   raw names. They are inconsistent between shapes because they are the upstream
-   vendor's CSV headers: `utility` uses `first_name`, `trace` uses `firstname`.
-   Reproduce them exactly.
+1. Keys here are RAW column names and they reach the wire unchanged — the JSON
+   payload carries `first_name`, not `firstName`. They are inconsistent between
+   shapes because they are the upstream vendor's CSV headers: `utility` uses
+   `first_name`, `trace` uses `firstname`. Reproduce them exactly.
 
-2. Order is part of the SDL. Reordering a shape changes schema.graphql and breaks
-   the contract test.
+2. Order is part of the contract. A record's keys are serialised in the order
+   declared here, so reordering a shape changes what the engine reads.
 """
 from __future__ import annotations
 
@@ -26,7 +25,8 @@ from occupancy_graph.source import derive
 OriginKind = Literal["col", "raw", "derived", "absent"]
 
 # Columns that get a `__norm_<name>` helper when present in a shape. Mirrors the
-# old graphdb._helper_columns set exactly; changing it changes the *Norm types.
+# old graphdb._helper_columns set exactly; changing it changes which `__norm_*`
+# keys a projected row carries (source/project.py).
 _NORMALIZABLE = {
     "phone", "mobile", "cellphone", "email", "email_02", "email_03",
     "owneraddressline1", "primaryaddress", "address", "street",
@@ -301,8 +301,9 @@ BASE = ShapeSpec(
     },
 )
 
-# Order matters: it drives the order of Query root fields in the SDL. This is the
-# old SOURCE_FILES order with voter/criminal/linkedin removed.
+# Order matters: it is the order of the `records_by_source` keys on the wire
+# (service/records.ALL_SHAPES is `tuple(SHAPES)`). This is the old SOURCE_FILES
+# order with voter/criminal/linkedin removed.
 SHAPES: dict[str, ShapeSpec] = {
     "base": BASE, "auto": AUTO, "drive": DRIVE,
     "loan": LOAN, "tax": TAX, "trace": TRACE, "utility": UTILITY,
