@@ -15,6 +15,7 @@ from occupancy_graph.service import sql_hatch
 from occupancy_graph.service.jsonio import jsonable
 from occupancy_graph.service.limits import DEFAULT_PAGE_LIMIT, PREFLIGHT_ROWS
 from occupancy_graph.service.pagination import Page, page_params, paginate
+from occupancy_graph.service.schema_doc import schema_document
 from occupancy_graph.service.sql_guard import SqlRefused
 from occupancy_graph.source import quality, search
 from occupancy_graph.source.bundle import AddressBundle
@@ -42,6 +43,13 @@ def error(status: int, message: str) -> JSONResponse:
 
 async def healthz(request: Request) -> JSONResponse:
     return JSONResponse({"status": "ok"})
+
+
+async def describe_schema(request: Request) -> JSONResponse:
+    """The curated corpus description. Touches no database: it is a constant
+    document plus the CURRENT limits, so it answers while the pool is busy and
+    reflects an env-var change without a restart."""
+    return ok(schema_document())
 
 
 def _candidate(bundle: AddressBundle) -> dict[str, Any]:

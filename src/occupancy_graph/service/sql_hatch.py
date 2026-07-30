@@ -18,6 +18,19 @@ import asyncpg
 from occupancy_graph.service import limits
 from occupancy_graph.service.jsonio import jsonable
 from occupancy_graph.service.limits import is_records_relation
+
+# Pinned verbatim by Contract C. It names the access paths that are actually
+# fast, so a refusal teaches the shape of what is servable instead of just
+# saying no.
+#
+# RE-EXPORTED, NOT RE-DECLARED. The same six paths are described at length by
+# GET /v1/schema, and while this string lived here they were two hand-written
+# lists that had already drifted apart -- this one named ssn/phone/email and
+# schema_doc did not. It is now generated from schema_doc.ACCESS_PATHS, so a
+# refusal cannot name a path the schema document omits.
+# tests/test_schema_doc.py pins both the generated text and the identity of
+# this name with schema_doc.HINT.
+from occupancy_graph.service.schema_doc import HINT
 from occupancy_graph.service.sql_guard import SqlRefused, parse, wrap_with_limit
 from occupancy_graph.source.pool import PartnerPool
 
@@ -30,13 +43,7 @@ from occupancy_graph.source.pool import PartnerPool
 # this is a widening of the annotation to match what is already passed.
 ConnectionSource = PartnerPool | asyncpg.Pool
 
-# Pinned verbatim by Contract C. It names the access paths that are actually
-# fast, so a refusal teaches the shape of what is servable instead of just
-# saying no.
-HINT = (
-    "No index supports this predicate. Indexed paths: zip; "
-    "(last_name, zip, house_number); (upper(state), upper(city)); ssn; phone; email."
-)
+__all__ = ["HINT", "SqlResult", "check_plan", "explain_plan", "run_query"]
 
 
 async def explain_plan(pool: ConnectionSource, wrapped: str) -> dict[str, Any]:

@@ -57,6 +57,7 @@ def create_app(*, pool: PartnerPool | None = None, cache: BundleCache | None = N
 
     routes = [
         Route("/healthz", handlers.healthz, methods=["GET"]),
+        Route("/v1/schema", handlers.describe_schema, methods=["GET"]),
         Route("/v1/resolve", handlers.resolve_address, methods=["POST"]),
         Route("/v1/address/{address_id:int}/records", handlers.address_records, methods=["GET"]),
         Route("/v1/address/{address_id:int}/people", handlers.address_people, methods=["GET"]),
