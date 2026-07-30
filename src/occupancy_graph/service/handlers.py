@@ -296,9 +296,12 @@ async def _hal_person_records(
                 "id": person_id,
                 "firstname": person["canonical_first_name"],
                 "lastname": person["canonical_last_name"],
-                # The partner ER graph is 17.9% suspicious, peaks at confidence
-                # 40.50 and never applies its computed merges. These two fields
-                # are how the model discounts it, so they are never omitted.
+                # The partner ER graph is 17.9% suspicious and never applies its
+                # computed merges. identity_confidence is MODAL at 40.50 (27.5%
+                # of rows, the rest spread over the 34-70 band, live rows seen
+                # at 70.85) -- NOT a maximum, so 40.50 must never be read as a
+                # ceiling. These two fields are how the model discounts the
+                # graph, so they are never omitted.
                 "identity_confidence": person["identity_confidence"],
                 "is_suspicious": person["is_suspicious"],
             },

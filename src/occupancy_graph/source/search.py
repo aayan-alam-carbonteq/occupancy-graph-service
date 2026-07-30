@@ -3,12 +3,21 @@
 people.py explains why this graph is NOT used for the address view. It is used
 here because for name search and for owner-elsewhere traversal the alternative
 is nothing at all -- and every row it returns carries identity_confidence and
-is_suspicious so the consumer can discount it. The graph is 17.9% suspicious,
-peaks at confidence 40.50, and never applies its own computed merges.
+is_suspicious so the consumer can discount it. The graph is 17.9% suspicious and
+never applies its own computed merges.
+
+identity_confidence is MODAL at 40.50 -- 27.5% of rows sit exactly there, with
+the rest of the mass spread across the 34-70 band and live rows observed at
+70.85. It is NOT a maximum. An earlier revision of this comment said the score
+"peaks at 40.50", which would invite a reader to treat 40.50 as a ceiling and
+read a row at it as the best confidence the graph can express. It is the most
+common value, nothing more.
 
 Measured: entity_links by hal_id 215 ms, by record_id 81 ms (both indexed).
 The rows those links point at are fetched by record_id, which the partner's
-index set does NOT cover -- see rows_for_links.
+index set does NOT cover -- see rows_for_links, and
+tests/test_live_smoke.py::test_no_index_covers_record_id_on_the_records_tables
+for the contradiction in our own specs that only credentials can settle.
 """
 from __future__ import annotations
 
