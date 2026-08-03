@@ -45,6 +45,25 @@ VALUES
    209, '2018-06-27', 1990, 'L', 171, 'USAA FED SAV BK',
    '2021-03-01', 132, 'QUICKEN');
 
+-- ANCHOR rows: the feeds that populate house_number in production (SSNxDOB,
+-- phonebook, historic) and that the resident-hop scan anchors on. Deliberately
+-- NOT shape feeds -- shapes_for_row() returns () for them -- because that is
+-- the production structure: house_number is NULL on utility/trace rows, so
+-- those are reachable only by hopping through a resident's anchor row. One
+-- anchor per resident surname at the subject address; without these, the
+-- utility row (Tenant) and second trace row (Smith) are invisible to the hop,
+-- which is exactly the coverage property the shim documents.
+INSERT INTO public.records_legacy
+  (record_id, source_file, imported_at, first_name, last_name,
+   house_number, address, city, state, zip)
+VALUES
+  (1901, 'SSNxDOB/ssnxdob_ky.csv', '2025-11-17',
+   'Jane', 'Doe', '123', '123 MAIN ST', 'LEXINGTON', 'KY', '40505'),
+  (1902, 'SSNxDOB/ssnxdob_ky.csv', '2025-11-17',
+   'John', 'Smith', '123', '123 MAIN ST', 'LEXINGTON', 'KY', '40505'),
+  (1903, '2014 US Phonebook/phonebook_ky.csv', '2025-11-17',
+   'Pat', 'Tenant', '123', '123 MAIN ST', 'LEXINGTON', 'KY', '40505');
+
 -- payday: serves BOTH the loan shape and the drive shape (same physical row).
 -- own_rent carries every casing observed in production.
 INSERT INTO public.records_new

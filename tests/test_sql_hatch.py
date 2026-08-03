@@ -208,16 +208,16 @@ async def test_a_result_exactly_at_the_cap_is_not_reported_as_truncated(client):
     Fetching exactly `cap` rows makes "there were precisely cap rows" and "there
     were more and we cut them" indistinguishable, so the boundary would always
     have to report truncated=true -- telling the agent to paginate a complete
-    result. records_legacy holds exactly 4 rows, so cap=4 is the boundary and
-    cap=3 is genuinely truncated.
+    result. records_legacy holds exactly 7 rows (4 shape rows + 3 resident-hop
+    anchors), so cap=7 is the boundary and cap=6 is genuinely truncated.
     """
     query = "SELECT record_id FROM public.records_legacy ORDER BY record_id"
-    exact = (await client.post("/v1/sql", json={"query": query, "max_rows": 4})).json()
-    assert exact["row_count"] == 4
+    exact = (await client.post("/v1/sql", json={"query": query, "max_rows": 7})).json()
+    assert exact["row_count"] == 7
     assert exact["truncated"] is False
 
-    short = (await client.post("/v1/sql", json={"query": query, "max_rows": 3})).json()
-    assert short["row_count"] == 3
+    short = (await client.post("/v1/sql", json={"query": query, "max_rows": 6})).json()
+    assert short["row_count"] == 6
     assert short["truncated"] is True
 
 
@@ -355,7 +355,8 @@ async def test_max_rows_refuses_garbage_and_clamps_out_of_range(client):
     body = (await client.post(
         "/v1/sql", json={"query": query, "max_rows": 10 ** 9}
     )).json()
-    assert body["row_count"] == 4
+    # 4 original legacy rows + 3 resident-hop anchor rows (seed.sql).
+    assert body["row_count"] == 7
     assert body["truncated"] is False
 
 

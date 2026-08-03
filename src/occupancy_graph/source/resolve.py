@@ -38,6 +38,10 @@ class AddressQuery:
     norm_address: str
     zip5: str
     like_prefix: str
+    # The leading house-number token ("1104", "12A"), or "" when the address
+    # has none. Drives the resident-hop anchor scan; exact-match against the
+    # partner's text house_number column.
+    house_number: str = ""
 
     @classmethod
     def build(cls, address: str, zip_code: str | None) -> "AddressQuery":
@@ -64,13 +68,28 @@ class AddressQuery:
             house = tokens[0]
             prefix = f"{house} {tokens[1]}" if len(tokens) > 1 else house
         else:
+            house = ""
             prefix = raw
         return cls(
             raw=raw,
             norm_address=normalized,
             zip5=zip5(zip_code),
             like_prefix=f"{prefix}%",
+            house_number=house,
         )
+
+    def matches_prefix(self, address: object) -> bool:
+        """The Python-side equivalent of `address ILIKE like_prefix`.
+
+        The resident-hop path fetches rows by indexed equality on columns that
+        are NOT the address (house_number, last_name), so the address filter
+        that the SQL path expressed as ILIKE moves client-side. like_prefix is
+        a startswith pattern by construction (one trailing %), so this is a
+        case-insensitive startswith. (A literal `_` in the prefix is treated
+        as itself here but as a single-char wildcard by ILIKE -- strictly
+        narrower, never broader.)
+        """
+        return str(address or "").upper().startswith(self.like_prefix[:-1].upper())
 
 
 @dataclass
@@ -103,7 +122,14 @@ async def scan_zip_sources(pool: PartnerPool, query: AddressQuery) -> ZipScanRes
         groups = pattern_groups(ZIP_SHAPES, table)
         if not groups:
             continue
-        for row in await _scan_table(pool, table, groups, query):
+        if table == "records_legacy":
+            # The zip+address heap filter does not finish on this table
+            # (observed active at 14+ min). Reach rows via the residents
+            # instead -- indexed equalities only. See _scan_legacy_via_residents.
+            rows = await _scan_legacy_via_residents(pool, query)
+        else:
+            rows = await _scan_table(pool, table, groups, query)
+        for row in rows:
             # A row can belong to more than one shape (loan/drive are the same
             # physical payday row), so this assigns rather than partitions.
             for shape in shapes_for_row(row):
@@ -226,6 +252,101 @@ async def _scan_table(
         record.pop("_feed_rank", None)
         out.append(decode_raw_data(record))
     return out
+
+
+# Resident-hop bounds. The anchor scan is one indexed probe; each name hop is
+# one more. All three limits exist to keep the worst case (a very common
+# surname, a dense building) bounded rather than open-ended.
+ANCHOR_LIMIT = 200
+NAME_HOP_LIMIT = 400
+MAX_NAME_HOPS = 8
+
+
+async def _scan_legacy_via_residents(
+    pool: PartnerPool, query: AddressQuery
+) -> list[dict]:
+    """records_legacy WITHOUT the unindexed address heap filter.
+
+    THE ONLY predicates used are indexed equalities, every one verified by raw
+    query against the live corpus on 2026-08-03:
+
+      anchor   zip = $1 AND house_number = $2      0.61 s cold, 63 rows
+      name hop last_name = $1 AND zip = $2         8.8-30.7 s cold, <=400 rows
+
+    versus the collapsed zip scan this replaces, which was observed
+    server-side ACTIVE at 14+ minutes without completing, because `address`
+    and `source_file` are heap filters over ~273k scattered rows at ~195 ms a
+    cold page.
+
+    HOW IT WORKS. `house_number` is populated on the anchor feeds (USCRM,
+    SSNxDOB, phonebook, historic) and NULL on utility/trace -- which is exactly
+    why the old (zip, house_number) probes "proved" feeds missing. So the
+    anchor scan cannot fetch shape rows directly; what it CAN do, in one
+    indexed probe, is name the residents. The name hop then fetches each
+    resident's rows through the (last_name, zip, house_number) btree -- and
+    THOSE include the utility/trace rows, verified live: the hop recovered
+    Trace x3 + Utility x1 at 1104 SPRING RUN RD that no anchor could reach.
+    The address filter the SQL path expressed as ILIKE runs client-side over
+    the handful of fetched rows instead of server-side over the whole ZIP.
+
+    COVERAGE, stated honestly: a resident with NO anchor-feed row is invisible
+    to the hop, so this can return a subset of what the full scan would. The
+    spec's live proof found 36 legacy rows at the subject address; the hop
+    recovers the residents' subset of them. That is the price of viability,
+    it is logged per address, and the alternative was a scan that does not
+    finish.
+
+    Anchors whose source_file happens to match a FEEDS pattern (USCRM is a
+    `base` feed) are themselves shape rows and are kept.
+    """
+    if not query.house_number:
+        # No house number to anchor on -- fall back to the collapsed scan and
+        # accept its cost rather than silently returning nothing.
+        logger.warning("resident hop: no house number in %r; falling back to zip scan",
+                       query.raw)
+        groups = pattern_groups(ZIP_SHAPES, "records_legacy")
+        return await _scan_table(pool, "records_legacy", groups, query)
+
+    rows_by_id: dict[object, dict] = {}
+    async with pool.acquire() as conn:
+        anchors = await conn.fetch(
+            f"SELECT * FROM public.records_legacy"
+            f" WHERE zip = $1 AND house_number = $2 LIMIT {ANCHOR_LIMIT}",
+            query.zip5, query.house_number,
+        )
+        # House 1104 exists on many streets in the ZIP; keep only the subject's.
+        at_address = [dict(r) for r in anchors if query.matches_prefix(r["address"])]
+        for row in at_address:
+            rows_by_id.setdefault(row["record_id"], row)
+
+        names: list[str] = []
+        seen_names: set[str] = set()
+        for row in at_address:
+            name = str(row.get("last_name") or "").strip()
+            if name and name.upper() not in seen_names:
+                seen_names.add(name.upper())
+                names.append(name)
+        if len(names) > MAX_NAME_HOPS:
+            logger.warning("resident hop: %d resident surnames at %r, hopping first %d",
+                           len(names), query.raw, MAX_NAME_HOPS)
+            names = names[:MAX_NAME_HOPS]
+
+        for name in names:
+            hop = await conn.fetch(
+                f"SELECT * FROM public.records_legacy"
+                f" WHERE last_name = $1 AND zip = $2 LIMIT {NAME_HOP_LIMIT}",
+                name, query.zip5,
+            )
+            if len(hop) == NAME_HOP_LIMIT:
+                logger.warning("resident hop: surname %r hit the %d-row cap in zip %s; "
+                               "rows beyond it are not seen", name, NAME_HOP_LIMIT, query.zip5)
+            for r in hop:
+                if query.matches_prefix(r["address"]):
+                    rows_by_id.setdefault(r["record_id"], dict(r))
+
+    logger.info("resident hop: %d anchors at address, %d surnames, %d rows total",
+                len(at_address), len(names), len(rows_by_id))
+    return [decode_raw_data(row) for row in rows_by_id.values()]
 
 
 @dataclass
