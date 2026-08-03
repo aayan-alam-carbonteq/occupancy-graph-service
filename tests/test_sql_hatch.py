@@ -122,7 +122,7 @@ async def test_the_refusal_names_a_partition_child_by_its_own_relation_name(fixt
     plan = await explain_plan(
         fixture_pool,
         wrap_with_limit(
-            "SELECT record_id FROM public.records_partitioned WHERE occupation = 'Manager'",
+            "SELECT record_id FROM public.records_new WHERE occupation = 'Manager'",
             cap=500,
         ),
     )
@@ -196,7 +196,7 @@ async def test_columns_are_reported_even_for_an_empty_result(client):
 async def test_the_row_cap_truncates_and_says_so(client):
     body = (await client.post(
         "/v1/sql",
-        json={"query": "SELECT record_id FROM public.records_partitioned", "max_rows": 2},
+        json={"query": "SELECT record_id FROM public.records_new", "max_rows": 2},
     )).json()
     assert body["row_count"] == 2
     assert body["truncated"] is True
@@ -235,7 +235,7 @@ async def test_non_json_types_survive_the_round_trip(client):
     body = (await client.post(
         "/v1/sql",
         json={"query": "SELECT imported_at, raw_data, identity_confidence "
-                       "FROM public.records_partitioned, silver.entity_master "
+                       "FROM public.records_new, silver.entity_master "
                        "WHERE record_id = 2001 AND hal_id = 'HAL0001'"},
     )).json()
     row = body["rows"][0]
@@ -302,7 +302,7 @@ async def test_the_ceiling_reverts_when_the_environment_does(client):
     query the previous test saw refused is served. A ceiling captured at import
     would leave that test's 0 in place for the rest of the session.
 
-    It returns no rows -- `employer` is only populated on records_partitioned --
+    It returns no rows -- `employer` is only populated on records_new --
     and that is beside the point: the assertion is that the plan was ACCEPTED, so
     the query reached execution and reported its columns.
     """
@@ -544,7 +544,7 @@ _COUNTED_TABLES = (
     "silver.entity_links",
     "silver.entity_master",
     "public.records_legacy",
-    "public.records_partitioned",
+    "public.records_new",
 )
 
 

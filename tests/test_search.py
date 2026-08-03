@@ -230,10 +230,11 @@ async def test_a_timeout_on_the_second_table_does_not_leak_the_first_tables_rows
 
 # --- One physical row reached two ways --------------------------------------
 #
-# schema.sql:66 makes records_new an unfiltered view over records_partitioned,
-# so entity_links can name a single physical row under two source_table values.
-# The fixture's own links only use records_legacy and records_new, so the
-# collision has to be injected.
+# PHYSICAL_TABLES maps both `records_new` and the alias `records_partitioned`
+# onto public.records_new, so entity_links could name a single physical row
+# under two source_table values. Measured 2026-08-03: production emits
+# `records_legacy` and `records_new` only (0 of 200 sampled links used
+# `records_partitioned`), so the collision is injected here rather than observed.
 
 
 async def test_the_same_physical_row_reached_through_the_view_and_its_base_table_is_returned_once(
@@ -256,8 +257,12 @@ async def test_the_same_physical_row_reached_through_the_view_and_its_base_table
     # Each relation was queried separately: the dedup is over the RESULTS, not a
     # merged query bucket that would assume the view is an unfiltered passthrough.
     assert len(pool.calls) == 2
+    # BOTH resolve to public.records_new: `records_partitioned` is an alias kept
+    # because entity_links.source_table is partner-supplied text, and the real
+    # relation of that name does not exist. The buckets stay separate so a future
+    # divergence between the two names remains visible in the warning below.
     assert "public.records_new" in pool.calls[0][0]
-    assert "public.records_partitioned" in pool.calls[1][0]
+    assert "public.records_new" in pool.calls[1][0]
     # The drop must be observable -- an inert guard teaches us nothing about
     # whether the partner really emits both link kinds for one row.
     assert "records_new" in caplog.text and "records_partitioned" in caplog.text

@@ -4,7 +4,7 @@ Phase 1 uses the `zip` btree plus a prefix filter on the free-text `address`
 column. This is THE access path: `house_number` is 0% populated on every feed the
 adapter reads, so predicating on it produces a plan that scans.
 
-Measured: 173 ms on records_partitioned (1.4 B rows), 1.30 s warm / 32 s cold on
+Measured: 173 ms on records_new (1.4 B rows), 1.30 s warm / 32 s cold on
 records_legacy (6.24 B rows).
 """
 from __future__ import annotations
@@ -190,7 +190,7 @@ async def scan_tax_source(
     clause, patterns = feed_clause("tax", start_index=4)
     sql = f"""
         SELECT *
-        FROM public.records_partitioned
+        FROM public.records_new
         WHERE upper(state) = $1
           AND upper(city) = $2
           AND address ILIKE $3

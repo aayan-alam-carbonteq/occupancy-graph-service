@@ -42,9 +42,9 @@ class _PhysicalTable(NamedTuple):
 
     storage_family: which underlying corpus the relation reads. `record_id` is
     unique only WITHIN a family, so it is the (family, record_id) pair that
-    identifies a physical row. records_new is a view over records_partitioned,
-    so both name the same family; records_legacy is a separate corpus that can
-    hold an unrelated row with the same record_id.
+    identifies a physical row. `records_new` and the alias `records_partitioned`
+    both name the partitioned family; records_legacy is a separate corpus that
+    can hold an unrelated row with the same record_id.
     """
 
     relation: str
@@ -59,7 +59,12 @@ class _PhysicalTable(NamedTuple):
 PHYSICAL_TABLES = {
     "records_legacy": _PhysicalTable("public.records_legacy", "legacy"),
     "records_new": _PhysicalTable("public.records_new", "partitioned"),
-    "records_partitioned": _PhysicalTable("public.records_partitioned", "partitioned"),
+    # `public.records_partitioned` DOES NOT EXIST on the live corpus (verified
+    # 2026-08-03). records_new is the partitioned PARENT and the relations named
+    # records_partitioned_* are its partitions. Accept the name as an
+    # entity_links.source_table value -- the partner may well emit it -- but
+    # route it to the real parent rather than to a relation that would raise.
+    "records_partitioned": _PhysicalTable("public.records_new", "partitioned"),
 }
 
 # Ceiling on links followed per person. 200 rows of one shape is already the
@@ -176,26 +181,58 @@ async def rows_for_links(
 ) -> tuple[list[dict[str, Any]], bool]:
     """Fetch the partner rows a set of entity_links points at.
 
-    Returns (rows, timed_out). THIS IS THE ONE UNINDEXED HOP in the typed
-    surface: entity_links is indexed both ways, but `record_id` on
-    records_legacy / records_partitioned is not covered by the partner's index
-    set, and records_partitioned cannot prune partitions on it. It therefore
-    runs under the pool's statement_timeout and DEGRADES rather than raising --
-    the caller reports records_timed_out=true so an empty result is never
-    mistaken for "this person has no records". An index on records_*(record_id)
-    is on the partner ask list.
+    Returns (rows, timed_out).
+
+    THE SLOW HOP -- but NOT for the reason this docstring gave until 2026-08-03.
+
+    It previously claimed record_id was "the one UNINDEXED hop ... not covered
+    by the partner's index set". THAT IS FALSE, and the partner ask it justified
+    was for an index that already exists. Catalog-verified on the live corpus:
+
+        records_legacy                 records_pkey, UNIQUE btree (record_id)
+        records_partitioned_p20251201  idx_..._record_id btree
+        records_partitioned_p20260101  idx_..._record_id btree
+        records_partitioned_p20260201  idx_..._record_id btree
+        records_partitioned_p20260301  idx_..._record_id btree
+
+    The cost is HEAP I/O, not the index, and it splits the two roots apart --
+    in the OPPOSITE direction to what the old text predicted. `EXPLAIN (ANALYZE,
+    BUFFERS) SELECT *` over record_ids sampled from real entity_links rows:
+
+        n ids  records_new (partitioned)   records_legacy
+            5                    100 ms           1 571 ms
+           50                     95 ms          27 012 ms
+          200                     90 ms          92 265 ms
+
+    records_new is FLAT at ~90 ms for 200 rows. Failing to prune partitions is
+    irrelevant: it visits all five, but each visit is an index seek into a
+    relation small enough to stay cached.
+
+    records_legacy is ~460 ms PER ROW and scales linearly, because 3749 GB of
+    heap means every row is a random page read that misses cache. Re-running the
+    SAME 50 ids proves it is I/O, not planning: 26 865 ms cold (138 pages read)
+    -> 878 ms warm (21 pages read), i.e. ~195 ms per cold random page.
+
+    So the degradation path is RIGHT and must stay, but it is a records_legacy
+    problem exclusively. With MAX_LINKS = 200, a legacy-heavy person exceeds any
+    sane statement_timeout, and cold is the honest number -- arbitrary US
+    addresses never arrive warm. The real partner ask is not an index on
+    record_id; it is either an address index (so this hop is not needed) or
+    storage that does not cost 195 ms a page.
 
     Degradation is all-or-nothing on purpose: a cancellation on the second
     physical table discards what the first already returned, because a partial
     set carries no marker distinguishing it from a complete one downstream.
 
-    Results are deduplicated on (storage_family, record_id). records_new is a
-    view over records_partitioned, so entity_links can name ONE physical row
-    under two source_table values; returning it twice would not raise, it would
-    inflate a per-person record count that feeds a downstream score. The dedup
-    runs over the accumulated RESULTS rather than by merging the two into one
-    query, because merging would assume the partner's view is an unfiltered
-    passthrough -- true of the fixture, unverifiable against production.
+    Results are deduplicated on (storage_family, record_id). `records_new` and
+    the alias `records_partitioned` name the same family, so entity_links could
+    name ONE physical row under two source_table values; returning it twice
+    would not raise, it would inflate a per-person record count that feeds a
+    downstream score. Measured: production entity_links emits `records_legacy`
+    and `records_new` only -- 0 of 200 sampled rows used `records_partitioned`
+    -- so this dedup is defensive, not observed. The dedup runs over accumulated
+    RESULTS rather than by merging the buckets into one query, so that a future
+    divergence between the two names stays visible in the warning below.
     """
     by_table: dict[str, list[int]] = {}
     for link in links:

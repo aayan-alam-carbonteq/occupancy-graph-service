@@ -76,7 +76,7 @@ async def test_scan_of_an_empty_address_returns_empty_without_querying(pool):
 
 async def test_scan_truncates_a_multi_table_shape_to_the_shape_budget(monkeypatch):
     """`base` is the only shape reading two tables (records_legacy,
-    records_partitioned). _scan_one applies MAX_ROWS_PER_SHAPE per table, so
+    records_new). _scan_one applies MAX_ROWS_PER_SHAPE per table, so
     without a post-loop truncation `base` would return double everyone else's
     budget. _scan_one is stubbed so this exercises the two-table combination
     deterministically, without inserting hundreds of rows into the shared

@@ -19,12 +19,9 @@ against any index at all. These tests are where those paths are actually
 confirmed. They are not decoration: each one fails if a real access path is
 broken, and none of them passes vacuously on an empty result.
 
-THREE OF THEM ARE OPEN QUESTIONS, NOT REGRESSION TESTS. They pin an assumption
+TWO OF THEM ARE OPEN QUESTIONS, NOT REGRESSION TESTS. They pin an assumption
 the shipped code rests on, and their failure is the news:
 
-  * test_no_index_covers_record_id_on_the_records_tables -- settles a
-    contradiction between two of our own documents. Read its docstring first
-    when credentials arrive; it is the FIRST thing to confirm.
   * test_the_role_physically_cannot_write -- a green run means the partner
     actioned the write-revocation ask. A red run means sql_guard.py is still
     the only control standing between an LLM and a 3.7 TB production database.
@@ -64,7 +61,7 @@ SUBJECT_HOUSE_NUMBER = "1104"
 WRITE_PRIVILEGES = ("INSERT", "UPDATE", "DELETE", "TRUNCATE")
 PROBED_TABLES = (
     "public.records_legacy",
-    "public.records_partitioned",
+    "public.records_new",
     "silver.entity_links",
     "silver.entity_master",
 )
@@ -222,14 +219,16 @@ async def test_the_people_at_the_address_cluster_from_real_rows(
 async def test_the_record_id_hop_returns_the_rows_entity_links_named(
     live_pool, subject_links
 ):
-    """THE UNINDEXED HOP, measured for real.
+    """THE SLOW HOP, measured for real.
 
     entity_links names N (source_table, record_id) pairs for this person. The
     rows behind them are fetched by `record_id` on records_legacy /
-    records_partitioned -- the one hop in the typed surface that no measurement
-    in any spec covers (every chain the specs timed stops at entity_links; see
-    the findings spec §7 and §11, whose address -> people query ends in a
-    GROUP BY over entity_links and never joins back to public.records_*).
+    records_new. Both ARE indexed on record_id (see
+    test_record_id_is_indexed_everywhere_and_legacy_is_still_slow), but the two
+    roots diverge by three orders of magnitude: 200 rows costs ~90 ms on
+    records_new and ~92 s on records_legacy, where 3749 GB of heap makes every
+    row a cold random page read at ~195 ms. A timeout here is therefore expected
+    on a legacy-heavy subject and is not a defect.
 
     The assertion is exact and cannot pass vacuously: if the fetch did NOT time
     out, then the rows the links point at must be there. Empty-and-not-timed-out
@@ -242,9 +241,10 @@ async def test_the_record_id_hop_returns_the_rows_entity_links_named(
         pytest.fail(
             f"the record_id hop timed out on {len(links)} links, at the pool's "
             "statement timeout. The service degrades correctly "
-            "(records_timed_out=true), so this is not a crash -- it is the "
-            "partner ask for an index on records_*(record_id) coming due. See "
-            "test_no_index_covers_record_id_on_the_records_tables."
+            "(records_timed_out=true), so this is not a crash. Expect this on a "
+            "records_legacy-heavy subject: the index exists, but 3749 GB of heap "
+            "costs ~195 ms per cold random page, so 200 rows takes ~92 s. See "
+            "test_record_id_is_indexed_everywhere_and_legacy_is_still_slow."
         )
     assert rows, (
         f"entity_links named {len(links)} rows for this person and the fetch "
@@ -313,7 +313,7 @@ async def test_the_measured_access_path_costs_still_hold(live_client):
     response = await live_client.post(
         "/v1/sql",
         json={
-            "query": "SELECT record_id, address FROM public.records_partitioned "
+            "query": "SELECT record_id, address FROM public.records_new "
                      "WHERE zip = '40514' AND address ILIKE '1104 Spring%'",
             "max_rows": 25,
         },
@@ -361,35 +361,49 @@ async def test_a_sequence_write_disguised_as_a_select_is_refused(live_client):
 # --- the three open questions ------------------------------------------------
 
 
-async def test_no_index_covers_record_id_on_the_records_tables(live_pool, subject_links):
-    """OPEN QUESTION -- CONFIRM THIS FIRST. Two of our own documents disagree.
+async def test_record_id_is_indexed_everywhere_and_legacy_is_still_slow(
+    live_pool, subject_links
+):
+    """SETTLED 2026-08-03. Was an open question; the answer inverted the design.
 
-      * docs/superpowers/specs/2026-07-27-partner-records-db-findings.md §6
-        ("Indexes present") lists `record_id` among the indexes on
-        `records_legacy` (14 idx) AND on every `records_new` partition (18-19
-        idx). That table reads like real introspection: it carries index counts
-        and per-table detail (`address_id` and `tsv_name` on the partitions
-        only, `(zip, house_number)` on legacy only).
-      * The pinned Contract B addendum 3 in the umbrella plan
-        (docs/superpowers/plans/2026-07-29-typed-data-service.md, "Contract B
-        addenda") states that **no index covers `record_id`**, and raises the
-        partner ask to add one.
+    Two of our own documents disagreed about whether `record_id` was indexed.
+    The findings spec §6 said yes; pinned Contract B addendum 3 said no, and the
+    SHIPPED CODE believed addendum 3 -- rows_for_links called this "the one
+    UNINDEXED hop", schema_doc.py told the agent lookups by record_id "scan",
+    and a partner ask was raised for an index that already existed.
 
-    The SHIPPED CODE believes the second: source/search.py::rows_for_links
-    degrades to `records_timed_out` on this hop, and service/schema_doc.py tells
-    the agent "record_id is not indexed on the records tables". This test pins
-    that belief, so a FAILURE here is the good news, not a regression:
+    **The findings spec was right.** Catalog probe against the live corpus:
 
-      -> If it fails, an index DOES exist. Update Contract B addendum 3, the
-         rows_for_links docstring, and the schema_doc caveat; drop the partner
-         ask for the index; and consider whether `records_timed_out` can stop
-         being a degradation path on records_legacy (it still cannot on
-         records_partitioned, which is partitioned by imported_at and therefore
-         cannot prune on record_id -- an ANY() probe must touch every
-         partition's index regardless).
+        records_legacy                 records_pkey, UNIQUE btree (record_id)
+        records_partitioned_p20251201  idx_..._record_id btree
+        records_partitioned_p20260101  idx_..._record_id btree
+        records_partitioned_p20260201  idx_..._record_id btree
+        records_partitioned_p20260301  idx_..._record_id btree
 
-    The catalog answer and the planner's answer are BOTH read, and asserted to
-    agree, so neither can be dismissed as a stale view.
+    But "indexed" did not mean "fast", and the slowness lands on the OPPOSITE
+    root from the one addendum 3 predicted. It reasoned that records_new, being
+    partitioned on imported_at, cannot prune on record_id and must touch every
+    partition. True -- and irrelevant. `EXPLAIN (ANALYZE, BUFFERS) SELECT *`
+    over record_ids sampled from real entity_links rows:
+
+        n ids  records_new (partitioned)   records_legacy
+            5                    100 ms           1 571 ms
+           50                     95 ms          27 012 ms
+          200                     90 ms          92 265 ms
+
+    records_new is FLAT: five index seeks into a relation small enough to stay
+    cached. records_legacy is ~460 ms PER ROW because 3749 GB of heap makes each
+    row a cold random page read. Re-running the SAME 50 ids proves it is I/O and
+    not planning: 26 865 ms cold (138 pages read) -> 878 ms warm (21 pages),
+    about 195 ms per cold random page.
+
+    So `records_timed_out` stays -- as a records_legacy path exclusively -- and
+    the partner ask is NOT an index on record_id. It is an address index (so
+    this hop is not needed at all) or faster storage.
+
+    This test now pins the settled facts. Timing is deliberately NOT asserted:
+    it depends on a buffer cache we share with the partner's own workload, and a
+    flaky test would teach us less than the numbers recorded above.
     """
     index_sql = """
         SELECT c.relname AS table_name,
@@ -429,12 +443,27 @@ async def test_no_index_covers_record_id_on_the_records_tables(live_pool, subjec
         f"records_legacy. Indexes found: {indexes}. Plan node types: {types}. "
         "Resolve that before trusting either half of this test."
     )
-    assert not indexes, (
-        "GOOD NEWS, AND AN ACTION: an index DOES cover record_id -- "
-        f"{indexes}. Contract B addendum 3 and service/schema_doc.py both say "
-        "none does, and the partner-DB findings spec §6 said one does all "
-        "along. The findings spec was right. Update both, drop the index ask, "
-        f"and re-read rows_for_links. Plan node types were {types}."
+    assert indexes, (
+        "record_id is NOT indexed on the records tables after all. That "
+        "reverses the 2026-08-03 catalog probe recorded in this docstring, in "
+        "source/search.py::rows_for_links and in service/schema_doc.py -- all "
+        "three describe the heap, not the index, as the cost. Re-derive them "
+        f"before trusting any of it. Plan node types were {types}."
+    )
+    covered = {row["table_name"] for row in indexes}
+    assert "records_legacy" in covered, (
+        f"records_pkey is missing from records_legacy. Covered: {sorted(covered)}"
+    )
+    partitions = {name for name in covered if name.startswith("records_partitioned_")}
+    assert len(partitions) >= 4, (
+        "every non-empty records_new partition should carry a record_id btree; "
+        f"only found {sorted(partitions)}. A partition without one turns the "
+        "flat ~90 ms fetch into a scan of that partition."
+    )
+    assert not scans, (
+        f"the planner chose a sequential scan for a record_id lookup: {types}. "
+        "The index exists, so this means the planner is rejecting it -- check "
+        "statistics before concluding anything about the access path."
     )
 
 

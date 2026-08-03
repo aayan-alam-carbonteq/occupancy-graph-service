@@ -41,14 +41,14 @@ async def test_seed_covers_every_shape_and_known_defect(fixture_pool):
             "SELECT DISTINCT split_part(source_file, '/', 1) AS feed FROM public.records_legacy"
         )
         new = await conn.fetch(
-            "SELECT DISTINCT split_part(source_file, '/', 1) AS feed FROM public.records_partitioned"
+            "SELECT DISTINCT split_part(source_file, '/', 1) AS feed FROM public.records_new"
         )
         shifted = await conn.fetchval(
-            "SELECT count(*) FROM public.records_partitioned "
+            "SELECT count(*) FROM public.records_new "
             "WHERE raw_data->>'streetNumber' IN ('True', 'False')"
         )
         variants = await conn.fetchval(
-            "SELECT count(DISTINCT own_rent) FROM public.records_partitioned "
+            "SELECT count(DISTINCT own_rent) FROM public.records_new "
             "WHERE own_rent IS NOT NULL"
         )
     feeds = {r["feed"] for r in legacy} | {r["feed"] for r in new}

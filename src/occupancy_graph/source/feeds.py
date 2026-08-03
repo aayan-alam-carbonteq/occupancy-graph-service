@@ -3,6 +3,22 @@
 `source_file` is NOT indexed in the partner DB. These clauses are only ever
 applied as heap filters on top of an index-qualified predicate (`zip`, or
 `upper(state)` + `upper(city)`), never as the driving condition.
+
+PHYSICAL TABLE NAMES, verified against the live corpus on 2026-08-03. There are
+exactly two roots:
+
+  records_legacy   a plain table, 3749 GB.
+  records_new      the PARTITIONED PARENT (relkind 'p'), RANGE (imported_at),
+                   whose five partitions are named records_partitioned_p20251201,
+                   _p20260101, _p20260201, _p20260301, records_partitioned_default.
+
+`public.records_partitioned` DOES NOT EXIST. This module previously named it as
+the table for base/loan/drive/auto/tax -- five of the seven shapes -- so every
+one of them would raise `relation "public.records_partitioned" does not exist`
+against production. The local fixture had the relationship inverted (it built
+records_partitioned as the parent and records_new as a view over it), so the
+entire suite validated a topology that does not exist. Query the parent and let
+Postgres route to partitions; do not reintroduce the name.
 """
 from __future__ import annotations
 
@@ -27,13 +43,13 @@ FEEDS: dict[str, FeedSpec] = {
                         ("Export Utility Stripped Down/%",)),
     "trace": FeedSpec("trace", ("records_legacy",),
                       ("Trace Skipping Oct 2025/%",)),
-    "base": FeedSpec("base", ("records_legacy", "records_partitioned"),
+    "base": FeedSpec("base", ("records_legacy", "records_new"),
                      ("2026.1-USCRM/%", "2019.2_USA_Consumer_LF%", "%CoReg%")),
-    "loan": FeedSpec("loan", ("records_partitioned",),
+    "loan": FeedSpec("loan", ("records_new",),
                      ("Payday_Big_%", "PD loan_master/%", "24mm _july-2025-loan-txt%")),
     # Same physical rows as `loan`: there is no DMV feed, only a licence number
     # carried on payday-loan rows.
-    "drive": FeedSpec("drive", ("records_partitioned",),
+    "drive": FeedSpec("drive", ("records_new",),
                       ("Payday_Big_%", "PD loan_master/%", "24mm _july-2025-loan-txt%"),
                       extra_sql=" AND dl_number IS NOT NULL"),
     # NOTE: the plan's spec text (2026-07-28-postgres-graph-adapter.md lines 1956-2084)
@@ -45,9 +61,9 @@ FEEDS: dict[str, FeedSpec] = {
     # redundant with "auto-%" for known feeds and the riskiest/most over-broad pattern
     # of the four against a 7.6B-row table. See tests/test_feeds.py for the count this
     # reconciles with.
-    "auto": FeedSpec("auto", ("records_partitioned",),
+    "auto": FeedSpec("auto", ("records_new",),
                      ("AvengerAuto%", "auto-%", "Auto Jan-Dec%")),
-    "tax": FeedSpec("tax", ("records_partitioned",),
+    "tax": FeedSpec("tax", ("records_new",),
                     ("property_owner%",)),
 }
 

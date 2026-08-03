@@ -46,10 +46,12 @@ TABLES = [
         ],
     },
     {
-        "name": "public.records_partitioned",
+        "name": "public.records_new",
         "purpose": (
             "Current feeds, partitioned by imported_at: payday loans (loan/drive), "
-            "auto, property_owner (tax). 1.4 B rows. Exposed as the view records_new."
+            "auto, property_owner (tax). 1.4 B rows. This IS the partitioned parent "
+            "-- its partitions are named records_partitioned_*, and there is no "
+            "relation called public.records_partitioned. Query the parent."
         ),
         "key_columns": [
             "record_id", "source_file", "imported_at", "first_name", "last_name",
@@ -84,7 +86,7 @@ TABLES = [
 ACCESS_PATHS = [
     {
         "predicate": "zip = $1 AND address ILIKE 'N STREET%'",
-        "table": "public.records_partitioned",
+        "table": "public.records_new",
         "index": "per-partition zip btree",
         "measured": "173 ms warm, 24 k rows examined",
         "hint_key": "zip",
@@ -105,25 +107,25 @@ ACCESS_PATHS = [
     },
     {
         "predicate": "upper(state) = $1 AND upper(city) = $2 AND address ILIKE 'N STREET%'",
-        "table": "public.records_partitioned",
+        "table": "public.records_new",
         "index": "(upper(state), upper(city))",
         "measured": "613 ms warm / 53 s cold, 151 507 rows examined. The ONLY path to tax.",
         "hint_key": "(upper(state), upper(city))",
     },
     {
         "predicate": "ssn = $1",
-        "table": "public.records_legacy and public.records_partitioned",
+        "table": "public.records_legacy and public.records_new",
         "index": "ssn (also ssn2) on both corpora",
         "measured": (
             "Not separately timed. Indexed on records_legacy and on every "
-            "records_partitioned partition; ssn is 95.7% populated on the payday "
+            "records_new partition; ssn is 95.7% populated on the payday "
             "partition and 0% on property_owner rows."
         ),
         "hint_key": "ssn",
     },
     {
         "predicate": "phone = $1",
-        "table": "public.records_legacy and public.records_partitioned",
+        "table": "public.records_legacy and public.records_new",
         "index": "phone (also mobile) on both corpora",
         "measured": (
             "Not separately timed. Population is the limit, not the index: phone "
@@ -133,7 +135,7 @@ ACCESS_PATHS = [
     },
     {
         "predicate": "lower(email) = lower($1)",
-        "table": "public.records_legacy and public.records_partitioned",
+        "table": "public.records_legacy and public.records_new",
         "index": "lower(email) on records_legacy; email on each partition",
         "measured": (
             "Not separately timed; email is 95.9% populated on the payday "
@@ -168,7 +170,7 @@ CAVEATS = [
     "source_file, or on raw_data. Predicating on any of them scans.",
     "source_file is the only feed identity and it is unindexed -- always pair it "
     "with an indexed predicate, never use it as the driving condition.",
-    "records_partitioned's partitions are separate DATASETS, not time slices: "
+    "records_new's partitions are separate DATASETS, not time slices: "
     "p20251201 e-commerce, p20260101 consumer marketing, p20260201 payday loans "
     "(931 M), p20260301 property_owner tax plus auto (233 M). Constraining "
     "imported_at picks a feed, not a date range.",
@@ -179,9 +181,12 @@ CAVEATS = [
     "routinely several hal_ids. Discount it accordingly.",
     "property_owner rows have ssn, dob and house_number 0% populated, so they carry "
     "no blocking key and are ABSENT from silver.entity_links entirely.",
-    "record_id is not indexed on the records tables; looking rows up by it scans. "
-    "Reach rows through silver.entity_links, and never make record_id the driving "
-    "predicate.",
+    "record_id IS indexed on every records relation (UNIQUE on records_legacy, a "
+    "btree on each records_new partition), but the two roots behave nothing alike: "
+    "fetching 200 rows by record_id costs ~90ms on records_new and ~92s on "
+    "records_legacy, where 3749GB of heap makes every row a cold random page read "
+    "(~195ms each). Reach rows through silver.entity_links, and expect a "
+    "legacy-heavy person to exceed the statement timeout.",
     "own_rent arrives as RENT/OWN/rent/own/Rent/Own/r/o and the meaningless '1' "
     "(11.6%). Normalize before comparing.",
     "trace raw_data degrades past Record_Date (valid 82.6%): Date_Of_Birth_Year "

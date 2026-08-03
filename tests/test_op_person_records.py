@@ -172,6 +172,6 @@ async def test_a_column_shifted_tax_row_reached_by_hal_id_is_dropped_not_served(
     body = (await client.get("/v1/person/hal:HAL0002/records")).json()
     assert body["records_by_source"]["tax"]["total_count"] == 0
     assert body["records_by_source"]["tax"]["records"] == []
-    # The traversal itself ran and did reach records_partitioned; the tax row was
+    # The traversal itself ran and did reach records_new; the tax row was
     # fetched and shape-classified, then dropped. The trace row is the control.
     assert body["records_by_source"]["trace"]["total_count"] == 1

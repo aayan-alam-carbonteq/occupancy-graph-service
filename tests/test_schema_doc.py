@@ -39,7 +39,7 @@ async def test_the_schema_names_the_tables_that_matter(client):
     body = response.json()
     names = {table["name"] for table in body["tables"]}
     assert names == {
-        "public.records_legacy", "public.records_partitioned",
+        "public.records_legacy", "public.records_new",
         "silver.entity_master", "silver.entity_links",
     }
     for table in body["tables"]:

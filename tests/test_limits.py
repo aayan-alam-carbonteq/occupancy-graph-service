@@ -29,7 +29,7 @@ ACCESS_PATHS = {
         WHERE zip = '40505' AND address ILIKE '123 MAIN%' LIMIT 200
     """,
     "city/state+prefix (613 ms - 53 s)": """
-        SELECT * FROM public.records_partitioned
+        SELECT * FROM public.records_new
         WHERE upper(state) = 'KY' AND upper(city) = 'LEXINGTON'
           AND address ILIKE '123 MAIN%' LIMIT 200
     """,

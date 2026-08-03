@@ -13,8 +13,11 @@ def test_utility_and_trace_live_in_the_legacy_table():
     assert FEEDS["trace"].tables == ("records_legacy",)
 
 
-def test_tax_lives_only_in_the_partitioned_table():
-    assert FEEDS["tax"].tables == ("records_partitioned",)
+def test_tax_lives_only_in_the_partitioned_parent():
+    """`records_new` IS the partitioned parent on the live corpus. The name
+    `records_partitioned` belongs to its PARTITIONS and is not a relation, so
+    naming it here would raise `relation does not exist` in production."""
+    assert FEEDS["tax"].tables == ("records_new",)
 
 
 def test_feed_clause_is_a_heap_filter_never_a_driving_predicate():

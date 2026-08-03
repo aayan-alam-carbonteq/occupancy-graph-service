@@ -47,7 +47,7 @@ VALUES
 
 -- payday: serves BOTH the loan shape and the drive shape (same physical row).
 -- own_rent carries every casing observed in production.
-INSERT INTO public.records_partitioned
+INSERT INTO public.records_new
   (record_id, source_file, imported_at, first_name, last_name, address, city, state, zip,
    own_rent, employer, occupation, dl_number, dl_state, raw_data)
 VALUES
@@ -68,7 +68,7 @@ VALUES
   (2009, 'Payday_Big_2/Payday_Big_2.csv', '2026-02-10', 'G', 'Gg', '7 G ST', 'X', 'KY', '40599', '1',    NULL, NULL, NULL, NULL, '{}'::jsonb);
 
 -- auto: three key casings across files, as the real feed ships them
-INSERT INTO public.records_partitioned
+INSERT INTO public.records_new
   (record_id, source_file, imported_at, first_name, last_name, address, city, state, zip, phone, raw_data)
 VALUES
   (3001, 'AvengerAuto-verified/AvengerAuto.csv', '2026-03-05', 'Jane', 'Doe',
@@ -80,7 +80,7 @@ VALUES
 
 -- property_owner (tax). NOTE: zip and house_number columns are NULL, as in production.
 -- Row 4001 is CLEAN and describes an absentee owner (mailing address in another state).
-INSERT INTO public.records_partitioned
+INSERT INTO public.records_new
   (record_id, source_file, imported_at, first_name, last_name, address, city, state, raw_data)
 VALUES
   (4001, 'property_owner_49/property_owner_49.csv', '2026-03-05', 'JANE', 'DOE',
@@ -98,7 +98,7 @@ VALUES
      "zipCodePlusFour": "40505-1046", "fipsState": "21", "fipsCounty": "067"}'::jsonb);
 
 -- 4002 is an LLC owner: derived `ownercompany` must be populated.
-INSERT INTO public.records_partitioned
+INSERT INTO public.records_new
   (record_id, source_file, imported_at, first_name, last_name, address, city, state, raw_data)
 VALUES
   (4002, 'property_owner_49/property_owner_49.csv', '2026-03-05', '', 'ACME',
@@ -112,7 +112,7 @@ VALUES
 -- 4003 is COLUMN-SHIFTED: the embedded GeoJSON split on its commas and every
 -- subsequent field slid. streetNumber holds a boolean, ownerZipCode holds a state.
 -- The adapter must DROP this row and count it.
-INSERT INTO public.records_partitioned
+INSERT INTO public.records_new
   (record_id, source_file, imported_at, first_name, last_name, address, city, state, raw_data)
 VALUES
   (4003, 'property_owner_37/property_owner_37.csv', '2026-03-05', 'FREDERICK', 'V',
@@ -158,7 +158,7 @@ VALUES
 -- scan (`WHERE zip = $1`) can never see this row. It is reachable ONLY through
 -- entity_links, which is the whole point, and it keeps the 123 MAIN ST bundle's
 -- loan/drive counts at 1 so no address-path assertion moves.
-INSERT INTO public.records_partitioned
+INSERT INTO public.records_new
   (record_id, source_file, imported_at, first_name, last_name, address, city, state, zip,
    own_rent, employer, occupation, dl_number, dl_state, raw_data)
 VALUES
