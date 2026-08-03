@@ -76,18 +76,20 @@ async def test_scan_of_an_empty_address_returns_empty_without_querying(pool):
 
 async def test_scan_truncates_a_multi_table_shape_to_the_shape_budget(monkeypatch):
     """`base` is the only shape reading two tables (records_legacy,
-    records_new). _scan_one applies MAX_ROWS_PER_SHAPE per table, so
+    records_new). _scan_table applies MAX_ROWS_PER_SHAPE per group, so
     without a post-loop truncation `base` would return double everyone else's
-    budget. _scan_one is stubbed so this exercises the two-table combination
+    budget. _scan_table is stubbed so this exercises the two-table combination
     deterministically, without inserting hundreds of rows into the shared
     fixture or depending on real network/DB state."""
     monkeypatch.setattr(resolve_module, "MAX_ROWS_PER_SHAPE", 1)
 
-    async def _fake_scan_one(pool, table, shape, query):
-        # Simulate every table hitting its own (patched) per-table LIMIT.
-        return [{"table": table}]
+    async def _fake_scan_table(pool, table, groups, query):
+        # Simulate every table hitting its own (patched) per-group LIMIT. The
+        # source_file is what assigns the shape now, so it has to be a real
+        # `base` feed name rather than an arbitrary marker.
+        return [{"source_file": "2026.1-USCRM/a.csv", "table": table}]
 
-    monkeypatch.setattr(resolve_module, "_scan_one", _fake_scan_one)
+    monkeypatch.setattr(resolve_module, "_scan_table", _fake_scan_table)
 
     result = await scan_zip_sources(None, AddressQuery.build("123 Main St", "40505"))
     assert len(result.rows_by_shape["base"]) == 1
@@ -111,32 +113,40 @@ async def test_scan_majority_vote_prefers_the_common_city_over_a_stray_row(monke
     "123 MAINLINE RD"), so a different street in the same ZIP can enter the
     candidate set, and conn.fetch() has no ORDER BY. First-non-null would pick
     whichever row happened to come back first; majority vote must not.
-    _scan_one is stubbed (rather than seeding the interfering row into the
+    _scan_table is stubbed (rather than seeding the interfering row into the
     shared, session-scoped fixture) so this can't perturb the exact
     per-shape row counts other tests assert against that same corpus."""
 
-    async def _fake_scan_one(pool, table, shape, query):
-        if shape == "utility":
-            return [{"city": "LEXINGTON", "state": "KY"}, {"city": "LEXINGTON", "state": "KY"}]
-        if shape == "trace":
-            return [{"city": "OTHERCITY", "state": "KY"}]
-        return []
+    async def _fake_scan_table(pool, table, groups, query):
+        if table != "records_legacy":
+            return []
+        return [
+            {"source_file": "Export Utility Stripped Down/a.csv",
+             "city": "LEXINGTON", "state": "KY"},
+            {"source_file": "Export Utility Stripped Down/a.csv",
+             "city": "LEXINGTON", "state": "KY"},
+            {"source_file": "Trace Skipping Oct 2025/a.csv",
+             "city": "OTHERCITY", "state": "KY"},
+        ]
 
-    monkeypatch.setattr(resolve_module, "_scan_one", _fake_scan_one)
+    monkeypatch.setattr(resolve_module, "_scan_table", _fake_scan_table)
 
     result = await scan_zip_sources(None, AddressQuery.build("123 Main St", "40505"))
     assert result.city == "LEXINGTON"
 
 
 async def test_scan_city_vote_tie_break_is_alphabetical_and_deterministic(monkeypatch):
-    async def _fake_scan_one(pool, table, shape, query):
-        if shape == "utility":
-            return [{"city": "ZZZTOWN", "state": "KY"}]
-        if shape == "trace":
-            return [{"city": "AAATOWN", "state": "KY"}]
-        return []
+    async def _fake_scan_table(pool, table, groups, query):
+        if table != "records_legacy":
+            return []
+        return [
+            {"source_file": "Export Utility Stripped Down/a.csv",
+             "city": "ZZZTOWN", "state": "KY"},
+            {"source_file": "Trace Skipping Oct 2025/a.csv",
+             "city": "AAATOWN", "state": "KY"},
+        ]
 
-    monkeypatch.setattr(resolve_module, "_scan_one", _fake_scan_one)
+    monkeypatch.setattr(resolve_module, "_scan_table", _fake_scan_table)
 
     query = AddressQuery.build("123 Main St", "40505")
     results = [(await scan_zip_sources(None, query)).city for _ in range(5)]
@@ -318,3 +328,74 @@ async def test_tax_scan_empty_result_is_ambiguous_between_no_record_and_wrong_ci
     assert result.timed_out is False
     assert result.queried_city == "NOWHERE"
     assert result.queried_state == "KY"
+
+
+# --- The collapse: one scan per TABLE, not one per (shape, table) ------------
+
+
+async def test_phase_one_issues_one_scan_per_table_not_one_per_shape(monkeypatch):
+    """THE POINT OF THE COLLAPSE, and the only test that fails if it regresses.
+
+    Six ZIP shapes span two tables, so the old loop issued SEVEN scans
+    (utility, trace, base x2 tables, loan, drive, auto). Every one of them
+    carried the identical indexed predicate -- same ZIP, same address prefix --
+    and only `zip` is indexed, so each re-read the whole ZIP off disk to
+    evaluate the unindexed address/source_file filters. On records_legacy that
+    was the same heap read three times over, and it is where the time went:
+    the backend sits at 100% IO/DataFileRead on the live corpus.
+
+    Two tables must therefore mean exactly two scans."""
+    calls: list[str] = []
+
+    async def _fake_scan_table(pool, table, groups, query):
+        calls.append(table)
+        return []
+
+    monkeypatch.setattr(resolve_module, "_scan_table", _fake_scan_table)
+    await scan_zip_sources(None, AddressQuery.build("123 Main St", "40505"))
+
+    assert calls == ["records_legacy", "records_new"]
+    assert len(calls) == 2, f"expected one scan per table, got {calls}"
+
+
+def test_loan_and_drive_are_one_group_because_they_are_the_same_rows():
+    """`drive` is not a feed -- it is `loan`'s payday rows that carry a
+    dl_number. Giving it its own group would scan identical heap pages twice to
+    return a subset of what the first scan already had."""
+    groups = resolve_module.pattern_groups(resolve_module.ZIP_SHAPES, "records_new")
+    labels = [label for label, _ in groups]
+    assert "loan" in labels
+    assert "drive" not in labels
+    # base, loan(+drive), auto -- three distinct pattern sets on this table.
+    assert len(groups) == 3
+
+
+def test_collapsed_sql_is_one_statement_carrying_every_pattern():
+    groups = resolve_module.pattern_groups(resolve_module.ZIP_SHAPES, "records_legacy")
+    sql, params = resolve_module._collapsed_scan_sql("records_legacy", groups)
+
+    # Every shape's patterns travel in ONE statement...
+    assert sql.count("FROM public.records_legacy") == 1
+    assert ";" not in sql
+    expected = [pattern for _, patterns in groups for pattern in patterns]
+    assert params == expected
+
+    # ...and each group still gets its own row budget, so a dense shape cannot
+    # consume the whole allowance and silently starve the others.
+    assert "row_number() OVER" in sql
+    assert "PARTITION BY CASE" in sql
+    assert f"_feed_rank <= {resolve_module.MAX_ROWS_PER_SHAPE}" in sql
+
+    # Parameters start at $3 -- $1 is zip, $2 is the address prefix.
+    assert "source_file LIKE $3" in sql
+    assert "$1" in sql and "$2" in sql
+
+
+def test_collapsed_sql_never_interpolates_partner_text():
+    """The CASE labels and the table name are interpolated, so they must be
+    literals this module owns. Patterns -- the only values that could ever be
+    influenced from outside FEEDS -- stay bound parameters."""
+    groups = resolve_module.pattern_groups(resolve_module.ZIP_SHAPES, "records_legacy")
+    sql, params = resolve_module._collapsed_scan_sql("records_legacy", groups)
+    for pattern in params:
+        assert pattern not in sql, f"{pattern!r} was interpolated instead of bound"

@@ -23,11 +23,18 @@ Postgres route to partitions; do not reintroduce the name.
 from __future__ import annotations
 
 import re
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
 from occupancy_graph.source.manifest import SHAPES
+
+
+# The partition boundaries of records_partitioned_p20260301, the ONLY partition
+# holding property_owner rows. Literals, not caller input -- they are only ever
+# interpolated into the tax feed clause below.
+TAX_PARTITION_START = "2026-03-01"
+TAX_PARTITION_END = "2026-04-01"
 
 
 @dataclass(frozen=True)
@@ -63,8 +70,25 @@ FEEDS: dict[str, FeedSpec] = {
     # reconciles with.
     "auto": FeedSpec("auto", ("records_new",),
                      ("AvengerAuto%", "auto-%", "Auto Jan-Dec%")),
+    # PARTITION PRUNING, measured 2026-08-03: the same tax predicate costs 241 s
+    # cold against the parent (all five partitions) and 165 s against
+    # records_partitioned_p20260301 alone. `source_file` is unindexed, so it
+    # cannot prune; `imported_at` IS the partition key and can.
+    #
+    # This is the mechanism schema_doc.py already documents -- "records_new's
+    # partitions are separate DATASETS, not time slices ... constraining
+    # imported_at picks a feed, not a date range". property_owner is loaded
+    # entirely into p20260301.
+    #
+    # THE RISK, stated plainly: if the partner loads property_owner into a LATER
+    # partition, this bound silently drops those rows -- a wrong answer, not an
+    # error. tests/test_live_smoke.py asserts the assumption against the live
+    # corpus so it fails loudly instead. Re-check whenever a new partition
+    # appears.
     "tax": FeedSpec("tax", ("records_new",),
-                    ("property_owner%",)),
+                    ("property_owner%",),
+                    extra_sql=f" AND imported_at >= '{TAX_PARTITION_START}'"
+                              f" AND imported_at < '{TAX_PARTITION_END}'"),
 }
 
 
@@ -77,6 +101,33 @@ def feed_clause(shape: str, start_index: int) -> tuple[str, list[str]]:
     placeholders = [f"source_file LIKE ${start_index + i}" for i in range(len(spec.patterns))]
     clause = "(" + " OR ".join(placeholders) + ")" + spec.extra_sql
     return clause, list(spec.patterns)
+
+
+def pattern_groups(shapes: Sequence[str], table: str) -> list[tuple[str, tuple[str, ...]]]:
+    """The DISTINCT (label, patterns) groups to scan for one table.
+
+    Collapsing the per-shape scans into one pass per table needs to know which
+    shapes actually live on that table, and which of them are the same rows.
+
+    Shapes with an IDENTICAL pattern tuple are one group: `drive` is the very
+    same physical payday row as `loan`, separated only by `dl_number IS NOT
+    NULL`, which shapes_for_row applies in Python. Scanning them as two groups
+    would read the same heap pages twice to return the same rows -- the exact
+    waste this collapse exists to remove. The FIRST shape in `shapes` order
+    wins the label; the caller re-derives the rest with shapes_for_row.
+
+    Returned in `shapes` order so the emitted SQL is deterministic, which is
+    what lets the tests pin the parameter positions.
+    """
+    groups: list[tuple[str, tuple[str, ...]]] = []
+    seen: set[tuple[str, ...]] = set()
+    for shape in shapes:
+        spec = FEEDS[shape]
+        if table not in spec.tables or spec.patterns in seen:
+            continue
+        seen.add(spec.patterns)
+        groups.append((shape, spec.patterns))
+    return groups
 
 
 def _like_to_regex(pattern: str) -> re.Pattern[str]:

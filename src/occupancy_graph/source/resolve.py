@@ -18,7 +18,7 @@ import asyncpg
 
 from occupancy_graph.normalize import normalize_address, zip5
 from occupancy_graph.source import quality
-from occupancy_graph.source.feeds import FEEDS, feed_clause
+from occupancy_graph.source.feeds import FEEDS, feed_clause, pattern_groups, shapes_for_row
 from occupancy_graph.source.pool import PartnerPool
 
 # Shapes reachable by the zip index. `tax` is excluded: property_owner rows have
@@ -88,12 +88,32 @@ async def scan_zip_sources(pool: PartnerPool, query: AddressQuery) -> ZipScanRes
         # corpus) truncated to MAX_ROWS_PER_SHAPE -- silently arbitrary rows
         # presented as a match. Refuse to query at all instead.
         return result
+    # ONE scan per TABLE, not one per (shape, table). Every shape on a table
+    # shares the identical indexed predicate and therefore the identical heap
+    # read; the only difference is an unindexed source_file filter. Scanning
+    # per shape re-read the same pages once per shape -- three times over on
+    # records_legacy, which is where essentially all the time goes.
+    tables: list[str] = []
     for shape in ZIP_SHAPES:
         for table in FEEDS[shape].tables:
-            rows = await _scan_one(pool, table, shape, query)
-            result.rows_by_shape[shape].extend(rows)
-        # MAX_ROWS_PER_SHAPE is a per-SHAPE budget. _scan_one applies it per
-        # table, so a multi-table shape like `base` would otherwise get double.
+            if table not in tables:
+                tables.append(table)
+
+    for table in tables:
+        groups = pattern_groups(ZIP_SHAPES, table)
+        if not groups:
+            continue
+        for row in await _scan_table(pool, table, groups, query):
+            # A row can belong to more than one shape (loan/drive are the same
+            # physical payday row), so this assigns rather than partitions.
+            for shape in shapes_for_row(row):
+                if shape in result.rows_by_shape:
+                    result.rows_by_shape[shape].append(row)
+
+    # MAX_ROWS_PER_SHAPE is a per-SHAPE budget and the window function applies
+    # it per (table, group). A shape spanning two tables -- `base` -- can still
+    # arrive with double, so the ceiling is re-applied here exactly as before.
+    for shape in ZIP_SHAPES:
         del result.rows_by_shape[shape][MAX_ROWS_PER_SHAPE:]
 
     cities = Counter(
@@ -133,21 +153,79 @@ def decode_raw_data(row: dict) -> dict:
     return row
 
 
-async def _scan_one(
-    pool: PartnerPool, table: str, shape: str, query: AddressQuery
-) -> list[dict]:
-    clause, patterns = feed_clause(shape, start_index=3)
-    sql = f"""
-        SELECT *
-        FROM public.{table}
-        WHERE zip = $1
-          AND address ILIKE $2
-          AND {clause}
-        LIMIT {MAX_ROWS_PER_SHAPE}
+def _collapsed_scan_sql(
+    table: str, groups: list[tuple[str, tuple[str, ...]]]
+) -> tuple[str, list[str]]:
+    """ONE query covering every shape on `table`, with a per-group row budget.
+
+    WHY THIS IS ONE QUERY AND NOT N. The predicate is
+    `zip = $1 AND address ILIKE $2 AND source_file LIKE ...`, and only `zip` is
+    indexed. `address` and `source_file` are heap filters, so EVERY row in the
+    ZIP must be read off disk to evaluate them. Measured on the live corpus:
+    the backend sits at 100% `IO / DataFileRead` and the planner expects
+    `rows=10` to survive -- so `LIMIT` never short-circuits either, because the
+    scan cannot know it is done until it has read everything.
+
+    That cost is paid PER SCAN, and it is identical for every shape on the
+    table: same ZIP, same address prefix, same pages. Running one scan per
+    shape re-read the same heap three times over on records_legacy to return
+    three disjoint handfuls of rows. This reads it once.
+
+    The per-group budget is preserved exactly rather than approximated. A bare
+    `LIMIT MAX_ROWS_PER_SHAPE * len(groups)` would let one dense shape consume
+    the whole allowance and starve the others -- silently, and only at the
+    addresses (large apartment buildings) where the cap matters at all. The
+    window function gives each group its own MAX_ROWS_PER_SHAPE, which is what
+    the per-shape scans guaranteed.
+
+    `drive` is deliberately absent from `groups` -- it shares `loan`'s patterns
+    and is re-derived by shapes_for_row via `dl_number`. See feeds.pattern_groups.
     """
+    params: list[str] = []
+    case_arms: list[str] = []
+    all_predicates: list[str] = []
+    for label, patterns in groups:
+        placeholders = []
+        for pattern in patterns:
+            params.append(pattern)
+            # +3: $1 is zip, $2 is the address prefix.
+            placeholders.append(f"source_file LIKE ${len(params) + 2}")
+        predicate = " OR ".join(placeholders)
+        all_predicates.append(predicate)
+        # Label is a literal from FEEDS, never caller text.
+        case_arms.append(f"WHEN {predicate} THEN '{label}'")
+    case_sql = "CASE " + " ".join(case_arms) + " END"
+    where_sql = " OR ".join(f"({predicate})" for predicate in all_predicates)
+    sql = f"""
+        SELECT * FROM (
+            SELECT *, row_number() OVER (
+                       PARTITION BY {case_sql} ORDER BY record_id
+                     ) AS _feed_rank
+            FROM public.{table}
+            WHERE zip = $1
+              AND address ILIKE $2
+              AND ({where_sql})
+        ) ranked
+        WHERE _feed_rank <= {MAX_ROWS_PER_SHAPE}
+    """
+    return sql, params
+
+
+async def _scan_table(
+    pool: PartnerPool, table: str, groups: list[tuple[str, tuple[str, ...]]],
+    query: AddressQuery,
+) -> list[dict]:
+    """Run the collapsed scan for one table. Shape assignment happens in Python."""
+    sql, patterns = _collapsed_scan_sql(table, groups)
     async with pool.acquire() as conn:
         rows = await conn.fetch(sql, query.zip5, query.like_prefix, *patterns)
-    return [decode_raw_data(dict(row)) for row in rows]
+    out = []
+    for row in rows:
+        record = dict(row)
+        # Scan bookkeeping, not partner data -- must not reach the projection.
+        record.pop("_feed_rank", None)
+        out.append(decode_raw_data(record))
+    return out
 
 
 @dataclass
