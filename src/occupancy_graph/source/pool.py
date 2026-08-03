@@ -88,6 +88,33 @@ def close_timeout_for(statement_timeout_ms: int) -> float:
     )
 
 
+# Client-side ceiling on how long we WAIT for one command.
+#
+# `statement_timeout` is a SERVER setting: it bounds how long the server will
+# WORK, not how long we will wait for the answer. Those two diverge the instant
+# the connection dies mid-query -- the server's statement dies with the socket,
+# and asyncpg goes on waiting for a reply that will never arrive. Nothing in the
+# pool can free it, because a connection stuck mid-command never releases.
+#
+# Observed 2026-08-03 against the live partner corpus. A bundle resolve issues a
+# tax scan that takes 241 s server-side and sends NOTHING on the socket while it
+# runs -- precisely what an idle NAT or firewall reaps. The client sat in
+# epoll_wait for 43 MINUTES at 0% CPU, with pg_stat_activity showing no active
+# statement for our user, and would have sat there indefinitely. In production
+# that is a request that never returns and a pool slot that never comes back.
+#
+# Deliberately set ABOVE statement_timeout so the server's own bound still wins
+# in the normal case and this fires only when the REPLY is lost rather than when
+# the query is merely slow. asyncpg raises TimeoutError, which the callers that
+# already handle QueryCanceledError degrade on identically.
+COMMAND_TIMEOUT_GRACE_SECONDS = 30.0
+
+
+def command_timeout_for(statement_timeout_ms: int) -> float:
+    """The client-side wait ceiling implied by a pool's statement timeout."""
+    return statement_timeout_ms / 1000 + COMMAND_TIMEOUT_GRACE_SECONDS
+
+
 def _int_env(name: str, default: int) -> int:
     """Read an int env var, failing closed with a message naming the culprit
     instead of a bare `int()` ValueError — never silently fall back to
@@ -141,6 +168,9 @@ class PartnerPool:
             dsn,
             min_size=min_size,
             max_size=max_size,
+            # The client-side backstop. Without it a lost reply blocks forever --
+            # see command_timeout_for.
+            command_timeout=command_timeout_for(statement_timeout_ms),
             server_settings={
                 "statement_timeout": str(int(statement_timeout_ms)),
                 "default_transaction_read_only": "on",

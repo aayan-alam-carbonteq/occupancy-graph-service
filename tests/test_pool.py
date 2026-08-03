@@ -580,3 +580,54 @@ async def test_a_real_pool_carries_the_derived_close_window(fixture_db):
         assert pool.close_timeout_seconds == pool_module.close_timeout_for(1_000)
     finally:
         await pool.close()
+
+
+# --- Client-side command timeout: a lost REPLY must not block forever ---------
+
+
+def test_command_timeout_sits_above_the_statement_timeout():
+    """The server bound must win for a merely-slow query, so the client ceiling
+    is deliberately the looser of the two. If this ever inverted, every slow
+    query would surface as a client TimeoutError and we would lose the
+    server's own (cancellable, logged) statement_timeout behaviour."""
+    for statement_timeout_ms in (1, 20_000, 400_000):
+        assert (
+            pool_module.command_timeout_for(statement_timeout_ms)
+            > statement_timeout_ms / 1000
+        )
+
+
+def test_command_timeout_is_derived_not_fixed():
+    """Raising the query budget must raise the wait ceiling with it -- a fixed
+    ceiling would silently start killing queries the operator just authorised."""
+    assert pool_module.command_timeout_for(400_000) == 430.0
+    assert pool_module.command_timeout_for(20_000) == 50.0
+
+
+def test_command_timeout_is_uncapped_unlike_the_close_window():
+    """close_timeout_for is capped at 25 s so shutdown cannot outlast the
+    orchestrator's patience. The command ceiling must NOT inherit that cap: a
+    400 s statement budget with a 25 s wait ceiling would time out on the client
+    every single time, which is the opposite of the bug this fixes."""
+    assert pool_module.close_timeout_for(400_000) == pool_module.MAX_CLOSE_TIMEOUT_SECONDS
+    assert pool_module.command_timeout_for(400_000) > pool_module.MAX_CLOSE_TIMEOUT_SECONDS
+
+
+async def test_the_pool_is_created_with_a_client_side_command_timeout(monkeypatch):
+    """The regression that motivated this: asyncpg.create_pool was called with a
+    server-side statement_timeout and NO command_timeout, so a reply lost to a
+    dead socket left the client in epoll_wait indefinitely (observed: 43 minutes
+    at 0% CPU, no active statement server-side). Assert the argument reaches
+    asyncpg, because that is the whole fix."""
+    seen: dict[str, object] = {}
+
+    async def fake_create_pool(dsn, **kwargs):
+        seen.update(kwargs)
+        return object()
+
+    monkeypatch.setattr(pool_module.asyncpg, "create_pool", fake_create_pool)
+    await pool_module.PartnerPool.create(
+        "postgresql://irrelevant/irrelevant", statement_timeout_ms=400_000
+    )
+    assert seen["command_timeout"] == 430.0
+    assert seen["server_settings"]["statement_timeout"] == "400000"
