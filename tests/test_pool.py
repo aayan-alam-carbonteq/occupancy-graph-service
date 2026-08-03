@@ -631,3 +631,42 @@ async def test_the_pool_is_created_with_a_client_side_command_timeout(monkeypatc
     )
     assert seen["command_timeout"] == 430.0
     assert seen["server_settings"]["statement_timeout"] == "400000"
+
+
+# --- TCP keepalives: the hang-class guard command_timeout could not be --------
+
+
+async def test_every_pooled_connection_gets_tcp_keepalives(fixture_db):
+    """command_timeout fires when a reply is lost, but asyncpg's cancellation
+    then waits on the SAME dead socket -- observed twice live: client in
+    epoll_wait, zero CPU, no server-side statement, pool slot gone. Keepalives
+    attack the cause: the NAT never sees the socket as idle. Assert the options
+    are actually ON the socket of a pooled connection, not merely requested."""
+    pool = await pool_module.PartnerPool.create(fixture_db, statement_timeout_ms=10_000)
+    try:
+        async with pool.acquire() as conn:
+            transport = getattr(conn, "_transport", None)
+            sock = transport.get_extra_info("socket") if transport else None
+            if sock is None:
+                pytest.skip("fixture DSN is not TCP; nothing to assert")
+            import socket as socket_module
+            assert sock.getsockopt(socket_module.SOL_SOCKET, socket_module.SO_KEEPALIVE) == 1
+            assert sock.getsockopt(socket_module.IPPROTO_TCP, socket_module.TCP_KEEPIDLE) \
+                == pool_module.KEEPALIVE_IDLE_SECONDS
+            assert sock.getsockopt(socket_module.IPPROTO_TCP, socket_module.TCP_KEEPINTVL) \
+                == pool_module.KEEPALIVE_INTERVAL_SECONDS
+            assert sock.getsockopt(socket_module.IPPROTO_TCP, socket_module.TCP_KEEPCNT) \
+                == pool_module.KEEPALIVE_COUNT
+    finally:
+        await pool.close()
+
+
+def test_keepalive_cadence_detects_death_before_the_command_timeout():
+    """The whole point is to unblock a lost-reply wait: the kernel must declare
+    the socket dead (idle + interval*count) before the shortest command_timeout
+    window a production statement budget implies would give up -- otherwise the
+    keepalives report the corpse only after everyone stopped listening."""
+    detect = (pool_module.KEEPALIVE_IDLE_SECONDS
+              + pool_module.KEEPALIVE_INTERVAL_SECONDS * pool_module.KEEPALIVE_COUNT)
+    assert detect <= pool_module.command_timeout_for(pool_module.DEFAULT_STATEMENT_TIMEOUT_MS) * 3
+    assert detect == 90  # 30 idle + 10*6 probes; a value change here is a design change

@@ -45,6 +45,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import socket
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 
@@ -115,6 +116,46 @@ def command_timeout_for(statement_timeout_ms: int) -> float:
     return statement_timeout_ms / 1000 + COMMAND_TIMEOUT_GRACE_SECONDS
 
 
+# TCP keepalive cadence. Why these exist -- and why command_timeout alone was
+# NOT enough, observed twice on 2026-08-03 against the live corpus:
+#
+# A multi-minute analytical query sends NOTHING on the socket while the server
+# works. A NAT/firewall between us and the partner reaps the mapping as idle,
+# so the server's eventual reply is lost. command_timeout does fire then, but
+# asyncpg's cancellation path waits for the server to confirm on the SAME dead
+# socket -- so the connection hangs in cancellation, its pool slot leaks, and
+# after max_size losses acquire() blocks forever. Reproduced WITH
+# command_timeout set: client in epoll_wait, zero CPU, pg_stat_activity empty.
+#
+# Keepalives fix the CAUSE rather than the symptom: probes every KEEPALIVE_IDLE
+# seconds keep the NAT mapping alive during long server-side work, and if the
+# path genuinely dies, KEEPALIVE_COUNT failed probes surface as a socket error
+# that unblocks asyncpg instead of an eternal wait. These are SOCKET options,
+# not server GUCs -- the RESET ALL hazard that rules out `init=` for session
+# settings (see module docstring) does not touch them, so a setup callback is
+# the right vehicle.
+KEEPALIVE_IDLE_SECONDS = 30
+KEEPALIVE_INTERVAL_SECONDS = 10
+KEEPALIVE_COUNT = 6
+
+
+async def _enable_tcp_keepalives(conn: asyncpg.Connection) -> None:
+    """Turn on TCP keepalives for one pooled connection's socket."""
+    transport = getattr(conn, "_transport", None)
+    sock = transport.get_extra_info("socket") if transport is not None else None
+    if sock is None:  # e.g. a unix-socket DSN in tests; nothing to keep alive
+        return
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, KEEPALIVE_IDLE_SECONDS)
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, KEEPALIVE_INTERVAL_SECONDS)
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, KEEPALIVE_COUNT)
+    except OSError as exc:
+        # A socket that refuses the options still works as a connection; log
+        # rather than fail the acquire, but loudly -- this is the hang guard.
+        logger.warning("could not enable TCP keepalives: %s", exc)
+
+
 def _int_env(name: str, default: int) -> int:
     """Read an int env var, failing closed with a message naming the culprit
     instead of a bare `int()` ValueError — never silently fall back to
@@ -171,6 +212,9 @@ class PartnerPool:
             # The client-side backstop. Without it a lost reply blocks forever --
             # see command_timeout_for.
             command_timeout=command_timeout_for(statement_timeout_ms),
+            # The hang-class guard: keepalives stop the NAT from reaping the
+            # socket under a long silent query. See _enable_tcp_keepalives.
+            setup=_enable_tcp_keepalives,
             server_settings={
                 "statement_timeout": str(int(statement_timeout_ms)),
                 "default_transaction_read_only": "on",
