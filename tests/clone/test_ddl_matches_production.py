@@ -40,3 +40,34 @@ async def test_records_new_has_all_five_production_partitions(fixture_pool):
     assert "2025-12-01" in got["records_partitioned_p20251201"]
     assert "2026-01-01" in got["records_partitioned_p20260101"]
     assert got["records_partitioned_default"] == "DEFAULT"
+
+
+# Every index production carries on records_legacy. Access-path behaviour is
+# the whole point of the clone: a missing index silently changes the plan the
+# experiments are meant to observe.
+EXPECTED_LEGACY_INDEXES = {
+    "records_pkey", "idx_records_zip", "idx_records_lastname_zip_house",
+    "idx_records_legacy_zip_house", "idx_records_legacy_state_city",
+    "idx_records_first_last", "idx_records_last_name_trgm", "idx_records_dob",
+    "idx_records_email", "idx_records_email2", "idx_records_mobile",
+    "idx_records_phone", "idx_records_ssn", "idx_records_ssn2",
+}
+
+
+async def test_records_legacy_carries_the_production_index_set(fixture_pool):
+    async with fixture_pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT indexname FROM pg_indexes
+            WHERE schemaname='public' AND tablename='records_legacy'""")
+    assert {r["indexname"] for r in rows} == EXPECTED_LEGACY_INDEXES
+
+
+async def test_every_partition_carries_a_record_id_index(fixture_pool):
+    """record_id IS indexed on every relation in production. The cost there is
+    heap I/O, not the index -- see source/search.py::rows_for_links."""
+    async with fixture_pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT tablename FROM pg_indexes
+            WHERE schemaname='public' AND tablename LIKE 'records_partitioned_%'
+              AND indexdef ~ '\\(record_id'""")
+    assert len({r["tablename"] for r in rows}) == 5
