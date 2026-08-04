@@ -1,0 +1,38 @@
+# The PERSISTENT clone. Distinct from tests/docker-compose.fixture.yml, which is
+# torn down (`down -v`) after every test session -- this one keeps its volume,
+# because a full load is 2.36M rows and rebuilding it is not a per-test-run cost
+# anyone should pay.
+#
+# Port 55433 deliberately differs from the fixture's 55432 so both can run at
+# once: the test suite must stay runnable while a clone is loaded.
+services:
+  graph-clone-db:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: clone
+      POSTGRES_PASSWORD: clone
+      POSTGRES_DB: partner_clone
+    ports:
+      - "55433:5432"
+    volumes:
+      - graph-clone-data:/var/lib/postgresql/data
+    # Sized for a 2.36M-row load carrying the full index set. The stock defaults
+    # make the index builds crawl; these are load-time settings, not a claim
+    # about production tuning -- the clone reproduces production's PLAN SHAPE,
+    # never its latency.
+    command:
+      - postgres
+      - -c
+      - shared_buffers=1GB
+      - -c
+      - maintenance_work_mem=1GB
+      - -c
+      - work_mem=64MB
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U clone -d partner_clone"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+volumes:
+  graph-clone-data:
