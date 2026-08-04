@@ -30,21 +30,47 @@ CREATE INDEX idx_records_ssn2 ON public.records_legacy USING btree (ssn2) WHERE 
 -- Production declares these per-partition (18 each). Declaring on the parent
 -- produces the same per-partition indexes and cannot skip a partition by
 -- accident, which hand-maintained per-partition DDL can.
-CREATE INDEX ON public.records_new USING btree (record_id);
-CREATE INDEX ON public.records_new USING btree (zip);
-CREATE INDEX ON public.records_new USING btree (address_id);
-CREATE INDEX ON public.records_new USING btree (city, state);
-CREATE INDEX ON public.records_new USING btree (upper(state), upper(city));
-CREATE INDEX ON public.records_new USING btree (last_name, zip, house_number);
-CREATE INDEX ON public.records_new USING btree (first_name, last_name);
-CREATE INDEX ON public.records_new USING gin (last_name gin_trgm_ops);
-CREATE INDEX ON public.records_new USING gin (tsv_name);
-CREATE INDEX ON public.records_new USING btree (dob) WHERE dob IS NOT NULL;
-CREATE INDEX ON public.records_new USING btree (phone);
-CREATE INDEX ON public.records_new USING btree (mobile);
-CREATE INDEX ON public.records_new USING btree (ssn);
-CREATE INDEX ON public.records_new USING btree (ssn2);
-CREATE INDEX ON public.records_new USING btree (email);
-CREATE INDEX ON public.records_new USING btree (lower(email));
-CREATE INDEX ON public.records_new USING btree (email2);
-CREATE INDEX ON public.records_new USING btree (lower(email2));
+--
+-- Two costs come with that, both irrelevant to how this file is actually used:
+--   - `CREATE INDEX CONCURRENTLY ... ON records_new` is rejected outright:
+--     "cannot create index on partitioned table \"records_new\" concurrently".
+--   - Dropping one partition's index directly (e.g.
+--     `DROP INDEX records_partitioned_p20251201_zip_idx`) is rejected too --
+--     "because index records_new_zip_idx requires it" -- until it is detached
+--     from the parent index with `ALTER INDEX ... DETACH PARTITION`.
+-- Neither matters here: this clone is always torn down and rebuilt from
+-- scratch (docker-compose down -v / conftest.py's fixture_db), never
+-- reindexed online or patched partition-by-partition. Online index builds and
+-- per-partition index surgery are production workflows this file has no
+-- occasion to exercise.
+--
+-- Named explicitly (production's own per-partition names are not usable here,
+-- since one parent index fans out to five child indexes with generated
+-- names) so a local EXPLAIN can be name-matched against production's plan --
+-- the entire reason this DDL exists. `idx_records_new_*`, expression spelled
+-- out wherever a column name alone would be ambiguous.
+CREATE INDEX idx_records_new_record_id ON public.records_new USING btree (record_id);
+CREATE INDEX idx_records_new_zip ON public.records_new USING btree (zip);
+CREATE INDEX idx_records_new_address_id ON public.records_new USING btree (address_id);
+CREATE INDEX idx_records_new_city_state ON public.records_new USING btree (city, state);
+CREATE INDEX idx_records_new_state_city_upper ON public.records_new USING btree (upper(state), upper(city));
+CREATE INDEX idx_records_new_lastname_zip_house ON public.records_new USING btree (last_name, zip, house_number);
+CREATE INDEX idx_records_new_first_last ON public.records_new USING btree (first_name, last_name);
+CREATE INDEX idx_records_new_last_name_trgm ON public.records_new USING gin (last_name gin_trgm_ops);
+CREATE INDEX idx_records_new_tsv_name ON public.records_new USING gin (tsv_name);
+CREATE INDEX idx_records_new_dob ON public.records_new USING btree (dob) WHERE dob IS NOT NULL;
+CREATE INDEX idx_records_new_phone ON public.records_new USING btree (phone);
+CREATE INDEX idx_records_new_mobile ON public.records_new USING btree (mobile);
+CREATE INDEX idx_records_new_ssn ON public.records_new USING btree (ssn);
+CREATE INDEX idx_records_new_ssn2 ON public.records_new USING btree (ssn2);
+-- email/city asymmetry vs. records_legacy below is real production shape, not
+-- an oversight: legacy carries ONLY the functional (lower()/upper()) form,
+-- new carries BOTH the plain and functional form of each (email, email2,
+-- state+city). Dumped as observed from pg_indexes on the live corpus
+-- 2026-08-04 -- preserve the asymmetry rather than "deduplicating" it, or a
+-- plan that depends on the plain-column index on records_new (and not on
+-- records_legacy) silently stops matching production's.
+CREATE INDEX idx_records_new_email ON public.records_new USING btree (email);
+CREATE INDEX idx_records_new_lower_email ON public.records_new USING btree (lower(email));
+CREATE INDEX idx_records_new_email2 ON public.records_new USING btree (email2);
+CREATE INDEX idx_records_new_lower_email2 ON public.records_new USING btree (lower(email2));
