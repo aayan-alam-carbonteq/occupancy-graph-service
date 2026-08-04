@@ -4,11 +4,25 @@
 -- topology production does not have once, and 548 tests passed while it did.
 -- Column list mirrors public.records_new exactly (144 columns).
 
+-- ORDER IS LOAD-BEARING: the TABLE drop must precede the VIEW drop.
+--
+-- `DROP VIEW IF EXISTS` does NOT no-op when the name exists as a TABLE -- it
+-- raises `"records_new" is not a view`. Since records_new IS a table here, a
+-- SECOND load of this file used to abort on line 1 under ON_ERROR_STOP=1,
+-- leaving the tables undropped, which then cascaded into
+-- `relation "records_pkey" already exists` from 002 and
+-- `relation "true_person" already exists` from 004 -- a half-built schema from
+-- what looks like a routine re-run. The persistent clone (unlike the test
+-- fixture, which is destroyed every session) is exactly where someone re-loads
+-- DDL after editing it, so these files must be idempotent.
 DROP SCHEMA IF EXISTS silver CASCADE;
-DROP VIEW IF EXISTS public.records_new CASCADE;      -- pre-2026-08-03 fixture shape
-DROP TABLE IF EXISTS public.records_partitioned CASCADE;  -- ditto; never existed in prod
 DROP TABLE IF EXISTS public.records_new CASCADE;
+DROP TABLE IF EXISTS public.records_partitioned CASCADE;  -- never existed in prod
 DROP TABLE IF EXISTS public.records_legacy CASCADE;
+-- Only reachable if a pre-2026-08-03 fixture (which built records_new as a VIEW
+-- over records_partitioned) is still on disk. A no-op now that the table above
+-- is already gone.
+DROP VIEW IF EXISTS public.records_new CASCADE;
 
 CREATE TABLE public.records_legacy (
   record_id bigint, source_file text, source_row integer, imported_at timestamptz,

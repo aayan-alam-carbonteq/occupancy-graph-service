@@ -7,7 +7,11 @@
 -- can never tell us, because we do not know its ground truth. Keeping it in its
 -- own schema is what stops ground truth from leaking into the surface under
 -- test.
-CREATE SCHEMA IF NOT EXISTS bench;
+-- Dropped and rebuilt, mirroring 001's treatment of `silver`. `CREATE SCHEMA IF
+-- NOT EXISTS` alone is not idempotent: the schema survives, so the CREATE TABLEs
+-- below hit `relation "true_person" already exists` on any re-load.
+DROP SCHEMA IF EXISTS bench CASCADE;
+CREATE SCHEMA bench;
 
 CREATE TABLE bench.true_person (
   person_id bigint PRIMARY KEY,
