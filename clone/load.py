@@ -53,6 +53,7 @@ from typing import Any
 import asyncpg
 
 from clone.loader.csvsource import read_shape_csv
+from clone.loader.entity import build_entities
 from clone.loader.feedplan import FEED_PLANS, FeedPlan
 from clone.loader.identity import DRIVE_JOIN_KEY, PersonIndex, synthetic_ssn
 from clone.loader.mapping import partner_row_for
@@ -402,6 +403,34 @@ async def _write_true_person(conn: asyncpg.Connection) -> int:
     return len(rows)
 
 
+async def _write_entity_graph(conn: asyncpg.Connection) -> tuple[int, int, int, int]:
+    """silver.entity_master / entity_links, built by ssn-blocking over every
+    loaded record. Returns (masters, links, new_links, legacy_links)."""
+    entity_rows = await conn.fetch("""
+        SELECT record_id, 'records_legacy'::text AS source_table, ssn, first_name,
+               last_name, address, city, state, zip
+        FROM public.records_legacy
+        UNION ALL
+        SELECT record_id, 'records_new'::text AS source_table, ssn, first_name,
+               last_name, address, city, state, zip
+        FROM public.records_new
+    """)
+    masters, links = build_entities([dict(r) for r in entity_rows])
+    if masters:
+        await conn.copy_records_to_table(
+            "entity_master", schema_name="silver",
+            columns=list(masters[0]), records=[list(m.values()) for m in masters],
+        )
+    if links:
+        await conn.copy_records_to_table(
+            "entity_links", schema_name="silver",
+            columns=list(links[0]), records=[list(l.values()) for l in links],
+        )
+    new_links = sum(1 for l in links if l["source_table"] == "records_new")
+    legacy_links = len(links) - new_links
+    return len(masters), len(links), new_links, legacy_links
+
+
 async def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--csv-dir", type=Path, required=True,
@@ -450,6 +479,11 @@ async def main() -> None:
         true_person_count = await _write_true_person(conn)
         print(f"  {true_person_count:,} true persons")
 
+        print("\nBuilding the entity graph (ssn blocking)...", flush=True)
+        masters, links, new_links, legacy_links = await _write_entity_graph(conn)
+        print(f"  {masters:,} entities, {links:,} links "
+              f"(records_new {new_links:,} : records_legacy {legacy_links:,})")
+
         print("\nANALYZE public.records_legacy, public.records_new...", flush=True)
         await conn.execute("ANALYZE public.records_legacy")
         await conn.execute("ANALYZE public.records_new")
@@ -464,6 +498,8 @@ async def main() -> None:
     if loan_total:
         print(f"drive fold-in: {loan_with_licence:,}/{loan_total:,} loan rows "
               f"received a licence ({loan_with_licence / loan_total:.1%})")
+    print(f"entity graph: {masters:,} entities, {links:,} links "
+          f"(records_new {new_links:,} : records_legacy {legacy_links:,})")
     if args.limit_per_shape is not None:
         print(f"*** TRUNCATED LOAD (--limit-per-shape={args.limit_per_shape}) -- "
               f"not representative of the full corpus. ***")
