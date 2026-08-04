@@ -13,6 +13,7 @@ from occupancy_graph.source.bundle import BundleCache
 from occupancy_graph.source.pool import PartnerPool
 
 FIXTURE_DIR = Path(__file__).parent / "fixtures"
+DDL_DIR = Path(__file__).parents[1] / "ddl"
 COMPOSE = Path(__file__).parent / "docker-compose.fixture.yml"
 TEST_DSN = os.environ.get("TEST_DSN", "postgresql://graph:graph@127.0.0.1:55432/graph_fixture")
 
@@ -21,20 +22,37 @@ def _compose(*args: str) -> None:
     subprocess.run(["docker", "compose", "-f", str(COMPOSE), *args], check=True)
 
 
+def _psql(path: Path) -> None:
+    subprocess.run(
+        ["docker", "compose", "-f", str(COMPOSE), "exec", "-T",
+         "graph-fixture-db", "psql", "-U", "graph", "-d", "graph_fixture",
+         "-v", "ON_ERROR_STOP=1"],
+        stdin=path.open("rb"), check=True,
+    )
+
+
 @pytest.fixture(scope="session")
 def fixture_db() -> str:
-    """Start the fixture Postgres, load DDL + seed, yield the DSN."""
+    """Start the fixture Postgres, load DDL + seed, yield the DSN.
+
+    ddl/*.sql loads first -- it is the records DDL shared with the persistent
+    clone (clone/docker-compose.clone.yml), so the two can never drift -- then
+    fixtures/schema.sql (fixture-only indexes/schemas) and fixtures/seed.sql.
+    """
     _compose("up", "-d", "--wait")
     try:
-        for path in ("schema.sql", "seed.sql"):
-            sql = FIXTURE_DIR / path
+        # Lexicographic order == dependency order: the numeric prefix on each
+        # ddl/ file must exceed every file it depends on. 001_records.sql
+        # (tables) -> 002_indexes.sql (indexes on those tables) ->
+        # 003_silver.sql -> 004_bench.sql (Tasks 2-4). The persistent clone
+        # loads this same directory the same way, so the contract has to hold
+        # there too, not just here.
+        for sql in sorted(DDL_DIR.glob("*.sql")):
+            _psql(sql)
+        for name in ("schema.sql", "seed.sql"):
+            sql = FIXTURE_DIR / name
             if sql.exists():
-                subprocess.run(
-                    ["docker", "compose", "-f", str(COMPOSE), "exec", "-T",
-                     "graph-fixture-db", "psql", "-U", "graph", "-d", "graph_fixture",
-                     "-v", "ON_ERROR_STOP=1"],
-                    stdin=sql.open("rb"), check=True,
-                )
+                _psql(sql)
         yield TEST_DSN
     finally:
         _compose("down", "-v")
