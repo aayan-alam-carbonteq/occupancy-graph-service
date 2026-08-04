@@ -44,6 +44,23 @@ async def test_search_by_last_name_alone_scores_lower(pool):
     assert results[0]["match_score"] == 0.6
 
 
+async def test_hal_id_has_no_bpchar_padding(pool):
+    """Pins search.py's _bpchar fix. hal_id is char(15) in production
+    (ddl/003_silver.sql, dumped from the live corpus 2026-08-04); Postgres pads
+    bpchar with trailing spaces on READ, and 'HAL0001' is 8 characters short of
+    that width. Before _entity() rstripped it, this assertion failed with
+    'HAL0001        ' (padded) != 'HAL0001' -- the fixture's old `text`-typed
+    hal_id could never reproduce that, so the leak was invisible until the
+    clone matched production's real width."""
+    _, results = await search.search_people(pool, "Jane Doe", limit=10)
+    hal_id = results[0]["hal_id"]
+    assert hal_id == "HAL0001"
+    assert not hal_id.endswith(" ")
+
+    person = await search.person_for_hal_id(pool, "HAL0001")
+    assert person["hal_id"] == "HAL0001"
+
+
 async def test_a_suspicious_entity_is_flagged_not_hidden(pool):
     _, results = await search.search_people(pool, "John Smith", limit=10)
     assert results[0]["is_suspicious"] is True

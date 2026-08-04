@@ -79,15 +79,44 @@ _ENTITY_COLUMNS = """
 """
 
 
+def _bpchar(value: str | None) -> str | None:
+    """rstrip a bpchar (`char(n)`) column read.
+
+    Postgres pads bpchar with trailing spaces on READ, not just on storage:
+    `'HAL0001'::char(15)` comes back as `'HAL0001        '` (padded to the
+    declared width). `WHERE hal_id = $1` still matches an unpadded bind
+    parameter because bpchar comparison ignores trailing whitespace -- which is
+    exactly why this stayed invisible for as long as it did: every WHERE-clause
+    lookup kept working while the padding silently leaked into every value this
+    module RETURNS (the search-result `id` and every `hal:`-prefixed citation
+    handle built from it). It surfaced only once ddl/003_silver.sql replaced the
+    fixture's `text`-typed hal_id (which does not pad) with production's real
+    char(15), dumped from the live corpus on 2026-08-04 -- 8 tests broke on
+    unexpected trailing whitespace the moment the fixture stopped hiding it.
+
+    hal_id and canonical_state are the only bpchar columns this query selects,
+    so they are the only ones that need it here. canonical_ssn (char(9)) and
+    canonical_phone (char(10)) exist on entity_master but are NOT in
+    _ENTITY_COLUMNS -- they never reach a row this function sees, so they
+    cannot leak through it today; add the same treatment if a future caller
+    starts selecting them.
+    """
+    return None if value is None else value.rstrip()
+
+
 def _entity(row: Mapping[str, Any]) -> dict[str, Any]:
     confidence = row["identity_confidence"]
     return {
-        "hal_id": row["hal_id"],
+        "hal_id": _bpchar(row["hal_id"]),
         "canonical_first_name": row["canonical_first_name"],
         "canonical_last_name": row["canonical_last_name"],
         "canonical_address_line1": row["canonical_address_line1"],
         "canonical_city": row["canonical_city"],
-        "canonical_state": row["canonical_state"],
+        # char(2): always exactly 2 characters for a real US state code, so the
+        # padding is invisible in practice -- but rstrip costs nothing and a
+        # short/malformed value (a 1-char state, say) would otherwise leak a
+        # trailing space same as hal_id did, so it gets the same treatment.
+        "canonical_state": _bpchar(row["canonical_state"]),
         "canonical_zip": row["canonical_zip"],
         "record_count": row["record_count"],
         # numeric -> Decimal over the wire; float here so it is JSON-ready and

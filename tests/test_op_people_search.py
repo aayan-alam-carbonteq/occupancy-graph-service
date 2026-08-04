@@ -27,6 +27,21 @@ async def test_search_returns_a_hal_scoped_result_with_its_address(client):
     assert result["zip"] == "40505"
 
 
+async def test_the_hal_handle_carries_no_bpchar_padding(client):
+    """Pins search.py's _bpchar fix at the HTTP boundary. hal_id is char(15) in
+    production (ddl/003_silver.sql, dumped from the live corpus 2026-08-04), and
+    Postgres pads bpchar with trailing spaces on READ -- 'HAL0001' would come
+    back 'HAL0001        ' unless _entity() rstrips it. Asserted as an exact
+    string, not a substring/prefix check, so a regression that reintroduces the
+    padding (e.g. a new call site that bypasses _entity()) fails loudly rather
+    than passing an `in` or `startswith` check that padding would still satisfy.
+    """
+    body = (await client.get("/v1/people/search?name=Jane%20Doe")).json()
+    result_id = body["results"][0]["id"]
+    assert result_id == "hal:HAL0001"
+    assert not result_id.endswith(" ")
+
+
 async def test_er_metadata_is_on_every_result(client):
     body = (await client.get("/v1/people/search?name=Jane%20Doe")).json()
     assert body["results"][0]["identity_confidence"] == 40.5
