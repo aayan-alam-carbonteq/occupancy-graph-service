@@ -59,6 +59,20 @@ argument** (never a hardcoded path) — that data lives in a different repo and 
 DVC-tracked, so pinning a path here would silently break the moment that repo's DVC cache
 moved.
 
+### Running the loader
+
+```bash
+.venv/bin/python -m clone.load --csv-dir /path/to/occupancy-engine/data/cleaned/lexington
+```
+
+Run it as a **module** (`-m clone.load`), from the repo root — never as a script path
+(`python clone/load.py`). `clone` is not an installed package (unlike `occupancy_graph`,
+which is reachable because `src/` is on the path via this project's editable install), so
+`python clone/load.py` puts only the `clone/` directory on `sys.path`, not the repo root,
+and every `from clone...` import inside it fails with `ModuleNotFoundError: No module
+named 'clone'`. `-m clone.load` runs from the repo root instead, which is on `sys.path` by
+construction, so the package resolves.
+
 ## Point the graph service at it
 
 No service code changes — none, now or ever. The service only ever learns where its

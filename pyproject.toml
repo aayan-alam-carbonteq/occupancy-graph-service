@@ -32,7 +32,12 @@ build-backend = "setuptools.build_meta"
 where = ["src"]
 
 [tool.pytest.ini_options]
-pythonpath = ["src", "tests"]
+# "." is required so `clone` (and its submodules) can be imported: unlike
+# `occupancy_graph`, which lands on the path via `src` below (mirroring its
+# editable install), `clone` is not an installed package. Without ".", the
+# suite only passes under `python -m pytest` (which prepends CWD to sys.path
+# itself) and dies under bare `pytest` with "No module named 'clone.loader'".
+pythonpath = [".", "src", "tests"]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "session"
 asyncio_default_test_loop_scope = "session"
