@@ -96,3 +96,69 @@ docker compose -f clone/docker-compose.clone.yml down -v
 and requires rebuilding from `ddl/*.sql` and reloading CSVs. Without `-v`,
 `docker compose down` / `up` (or `restart`) leaves the data untouched; that is the entire
 reason this container exists instead of reusing the fixture's compose file.
+
+---
+
+## Measured results (2026-08-04 load)
+
+Every number below was produced by the scripts in this directory, not estimated.
+
+### Load
+
+```
+2,355,742 records in 427s, byte-identical across repeated runs (deterministic)
+  records_legacy 1,969,547   records_new 386,195
+  utility 1,506,562 · trace 439,820 · base 185,319 · loan 81,302 · auto 64,296 · tax 78,443
+oracle          705,842 persons / 2,355,742 true_person_record rows (exact coverage)
+drive fold-in   21,927 / 81,302 loan rows carry a licence (27.0%)
+entity graph    21,163 entities · 77,893 links · records_new 77,893 : records_legacy 0
+anchors         22,702 rows carry house_number (base/USCRM only, as production does)
+```
+
+The entity graph's `records_new`-only skew is **emergent, not imposed**: ssn is populated only on the
+payday feeds, exactly as production does it, so ssn-blocking naturally links almost nothing else and
+leaves tax entirely unlinked. That is production's own mechanism, reproduced rather than imitated.
+
+Fidelity suite: **19/19** (`CLONE_DSN=... pytest tests/clone/test_clone_profile.py`).
+
+### It serves the real service
+
+`POST /v1/resolve` for 1104 SPRING RUN RD returns **HTTP 200 in 0.2 s** with the AURORA, IL
+absentee-owner signal intact — against **62 s cold** on the live corpus. That speed is the clearest
+possible restatement of the warning above: **latency does not transfer.**
+
+### Resident-hop coverage — the measurement production cannot give us
+
+`python -m clone.coverage_experiment`. Against the real corpus the full ZIP scan never finishes
+(observed server-side ACTIVE at 14+ minutes), so this loss has never been measurable. Locally both
+paths run.
+
+| group | addresses | recall |
+|---|---|---|
+| **≥1 surviving anchor** — the hop's true recall | 2 / 12 | **31.6%** (27.8%, 35.0%) |
+| **0 surviving anchors** — the anchor-coverage problem | 10 / 12 | 0.0% |
+| blended | 12 | 4.7% |
+
+**Read the split, never the blend.** The blended 4.7% describes anchor availability, not the hop.
+Where the hop has any resident to work from it recovers ~32% of what a full scan finds; where it has
+none it cannot run at all. Those are different failures and averaging them hides both.
+
+**This is a LOWER BOUND on production.** We hold 1 of production's 4 house_number-bearing anchor
+feeds (USCRM; production also has SSNxDOB, the 2014 phonebook and Historic Data), so production's hop
+has strictly more anchors. The 10 zero-anchor addresses are precisely where those feeds would matter.
+
+### Clone vs. live counts
+
+`python -m clone.compare_to_live` diffs all 12 mini.csv addresses against the recorded live run.
+Totals `clone/live`: utility 9/60 · trace 1/118 · base 24/34 · loan 11/55 · drive 0/30 · auto 4/11 ·
+tax 17/18.
+
+Two **independent** causes, and both matter:
+
+1. **Anchor thinness** (above) — dominates the legacy-only shapes, utility and trace.
+2. **The Lexington CSVs are a statistically-calibrated sample, not a row-for-row mirror** of the live
+   corpus. Verified directly: 1552 SAMARA GLEN WAY genuinely holds 4 payday rows in the clone against
+   10 live. This is why `records_new` shapes — which bypass the resident hop entirely — still
+   diverge, and it is why `tax` is the one column where the clone sometimes *exceeds* live.
+
+Do not attribute every difference to the hop.
