@@ -59,6 +59,7 @@ from clone.loader.identity import DRIVE_JOIN_KEY, PersonIndex, synthetic_ssn
 from clone.loader.mapping import partner_row_for
 from clone.loader.population import keep_value, load_targets
 from clone.loader.writer import RecordBatch
+from occupancy_graph.source.manifest import SHAPES
 
 DEFAULT_DSN = "postgresql://clone:clone@127.0.0.1:55433/partner_clone"
 
@@ -84,13 +85,34 @@ RECORD_ID_BASE = {"records_legacy": 1_000_000_000, "records_new": 7_000_000_000}
 # position in base.csv so the same row always lands on the same side.
 BASE_LEGACY_MODULUS = 8
 
-# Columns population.py may DROP if already present. Notably this never ADDS a
-# column (unlike ssn, handled separately below): mapping.py declares every
-# shape's `house_number` origin as `derived()`, meaning partner_row_for never
-# writes it at all -- reproducing production's own house_number-population
-# rule is mapping.py's job, not this loader's, and mapping.py is out of scope
-# here (see its docstring for why materialising it would be wrong).
-OPTIONAL_POPULATION_COLUMNS = ("dob", "phone", "email", "house_number")
+# Columns population.py may DROP if already present. These arrive via
+# mapping.py, so this list only ever REMOVES.
+OPTIONAL_POPULATION_COLUMNS = ("dob", "phone", "email")
+
+# house_number is LOADER-OWNED, not manifest-driven, and that distinction is
+# load-bearing.
+#
+# It is an ACCESS PATH, not projected evidence. No shape reads it as a column --
+# tax takes it from raw_data.streetNumber, and trace/auto/base declare it
+# `derived()` because the READ path computes it from address text. But
+# resolve.py::_scan_legacy_via_residents anchors with
+# `WHERE zip = $1 AND house_number = $2`, querying the COLUMN directly, and that
+# anchor is the only bridge from an address to the residents whose names then
+# reach the utility/trace rows.
+#
+# Leaving it to mapping.py meant it was never written at all, so the clone had
+# ZERO anchors: resolving 1104 SPRING RUN RD returned utility=0, trace=0 where
+# the live corpus returns 1 and 3. That silently disables the resident hop --
+# and with it both the correctness testing and the coverage measurement this
+# clone exists for.
+#
+# Which feeds carry it is still decided by the recorded production profile
+# (feed_population.json: base 100%, everything else 0%), NOT by which CSVs
+# happen to have a housenumber column. Ours carry it at ~100% on trace/auto/tax
+# where production has it NULL; honouring the CSV instead of the profile would
+# hand the hop anchors production does not have and make the coverage number a
+# flattering fiction.
+HOUSE_NUMBER_CSV_FIELD = "housenumber"
 
 
 CATALOG_PATH = Path(__file__).parent / "profiles" / "records_catalog.json"
@@ -273,17 +295,57 @@ def _load_licences(drive_csv: Path) -> dict[tuple[str, str, str, str], tuple[str
     return licences
 
 
+def _population_source_fields(shape: str) -> dict[str, str]:
+    """partner column -> the CSV field that feeds it, for the tracked columns.
+
+    Resolved from the manifest ONCE per shape rather than per row, so measuring
+    source population costs one dict lookup per column per row rather than a
+    full re-mapping. house_number is added separately because it is
+    loader-owned, not manifest-driven -- see HOUSE_NUMBER_CSV_FIELD.
+    """
+    fields = {
+        origin.key: name
+        for name, origin in SHAPES[shape].fields.items()
+        if origin.kind == "col" and origin.key in OPTIONAL_POPULATION_COLUMNS
+    }
+    fields["house_number"] = HOUSE_NUMBER_CSV_FIELD
+    return fields
+
+
 async def _build_identity(
     csv_dir: Path, limit_per_shape: int | None
-) -> PersonIndex:
+) -> tuple[PersonIndex, dict[str, dict[str, float]]]:
+    """Pass 1: union-find identity, plus the SOURCE population rate per column.
+
+    The rates are measured here rather than in a third read because this pass
+    already visits every row, and Pass 2 needs them BEFORE it can decide what to
+    keep: without them the down-sample multiplies against an already-sparse
+    source instead of targeting production's rate. See population.keep_value.
+    """
     index = PersonIndex()
+    populated: dict[str, dict[str, int]] = {}
+    totals: dict[str, int] = {}
     for plan in FEED_PLANS:
+        source_fields = _population_source_fields(plan.shape)
+        seen = populated.setdefault(plan.shape, dict.fromkeys(source_fields, 0))
         count = 0
         for row in _plan_rows(plan, csv_dir, limit_per_shape):
             index.add(**_identity_fields(plan.shape, row))
+            for column, csv_field in source_fields.items():
+                if row.get(csv_field, ""):
+                    seen[column] += 1
             count += 1
+        totals[plan.shape] = totals.get(plan.shape, 0) + count
         print(f"  identity: {plan.shape:8s} -> {plan.table:15s} {count:>9,} rows", flush=True)
-    return index
+
+    rates = {
+        shape: {
+            column: (n / totals[shape] if totals.get(shape) else 0.0)
+            for column, n in columns.items()
+        }
+        for shape, columns in populated.items()
+    }
+    return index, rates
 
 
 async def _write_records(
@@ -293,6 +355,7 @@ async def _write_records(
     persons: dict[int, int],
     licences: dict[tuple[str, str, str, str], tuple[str, str]],
     targets,
+    source_rates: dict[str, dict[str, float]],
 ) -> tuple[int, int, int, int, dict[str, int], dict[str, int]]:
     """Pass 2: map, populate and COPY every plan's rows, flushing per plan.
 
@@ -342,10 +405,20 @@ async def _write_records(
             # module docstring and clone/loader/entity.py for why this single
             # decision is what makes the entity graph link almost only loan
             # rows, matching production's mechanism rather than its numbers.
+            shape_rates = source_rates.get(plan.shape, {})
+            # ssn is STAMPED, never carried by the CSV, so it has no source
+            # rate to correct against -- the target IS the final rate.
             if keep_value(plan.shape, "ssn", row_key, targets):
                 columns["ssn"] = synthetic_ssn(person_id)
+            # ADDED, not dropped -- see HOUSE_NUMBER_CSV_FIELD. The profile gate
+            # is what confines it to the feeds production populates.
+            house_number = row.get(HOUSE_NUMBER_CSV_FIELD, "")
+            if house_number and keep_value(plan.shape, "house_number", row_key, targets,
+                                           shape_rates.get("house_number")):
+                columns["house_number"] = house_number
             for optional in OPTIONAL_POPULATION_COLUMNS:
-                if optional in columns and not keep_value(plan.shape, optional, row_key, targets):
+                if optional in columns and not keep_value(
+                        plan.shape, optional, row_key, targets, shape_rates.get(optional)):
                     columns.pop(optional)
 
             batch.add(record_id=record_id, table=plan.table, source_file=plan.source_file,
@@ -458,10 +531,17 @@ async def main() -> None:
     targets = load_targets()
 
     print("Pass 1/2: building the person identity graph across all shapes...", flush=True)
-    index = await _build_identity(args.csv_dir, args.limit_per_shape)
+    index, source_rates = await _build_identity(args.csv_dir, args.limit_per_shape)
     persons = index.person_ids()
     distinct_persons = len(set(persons.values()))
     print(f"  {len(persons):,} rows clustered into {distinct_persons:,} persons\n", flush=True)
+    # The source rates are what turn each target into a TARGET rather than a
+    # discount applied on top of already-sparse data -- see keep_value.
+    for shape in sorted(source_rates):
+        measured = {c: f'{r:.1%}' for c, r in sorted(source_rates[shape].items()) if r}
+        if measured:
+            print(f"  source population {shape:8s} {measured}", flush=True)
+    print(flush=True)
 
     print("Loading drive licences for the loan fold-in...", flush=True)
     licences = _load_licences(args.csv_dir / "drive.csv")
@@ -472,7 +552,8 @@ async def main() -> None:
     try:
         await _register_tsvector_codec(conn)
         written, oracle_rows, loan_total, loan_with_licence, shape_totals, coercion_failures = (
-            await _write_records(conn, args.csv_dir, args.limit_per_shape, persons, licences, targets)
+            await _write_records(conn, args.csv_dir, args.limit_per_shape, persons,
+                                 licences, targets, source_rates)
         )
 
         print("\nPopulating bench.true_person from the oracle...", flush=True)

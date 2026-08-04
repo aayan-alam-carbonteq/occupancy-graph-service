@@ -1,8 +1,28 @@
 {
+  "_comment": [
+    "Per-feed column population, read from public.feed_id_coverage on the live",
+    "corpus 2026-08-04. These are TARGETS the loader steers toward, not",
+    "descriptions of our CSVs.",
+    "",
+    "Why it matters: packet_gates.ts gates SIX OF SEVEN evidence packets on",
+    "FIELD PRESENCE, so a clone with phone at 90% where production has 41.9%",
+    "runs packets production would skip, and every coverage number drifts.",
+    "",
+    "null means NOT REPRESENTABLE, which is different from 0.0:",
+    "  0.0  - production genuinely has none. property_owner carries no ssn, dob",
+    "         or house_number at all, and that is exactly why production's",
+    "         entity_links contains no tax rows.",
+    "  null - our CSV/manifest carries no such field, so production's rate is",
+    "         unreachable by construction and the loader must not invent one.",
+    "         LOAN declares no dob/phone/email field; TRACE carries dob only as",
+    "         raw dob_day/dob_month/dob_year, never a plain dob column; BASE has",
+    "         no email field. Recorded as a measured gap so a future reader does",
+    "         not read 0% here as a loader bug."
+  ],
   "utility": {"ssn": 0.0,  "dob": 93.9, "phone": 41.9, "email": 0.0,  "house_number": 0.0},
-  "trace":   {"ssn": 0.0,  "dob": 34.2, "phone": 76.0, "email": 8.9,  "house_number": 0.0},
-  "base":    {"ssn": 0.0,  "dob": 86.0, "phone": 0.0,  "email": 53.9, "house_number": 100.0},
-  "loan":    {"ssn": 95.8, "dob": 94.4, "phone": 84.1, "email": 95.9, "house_number": 0.0},
+  "trace":   {"ssn": 0.0,  "dob": null, "phone": 76.0, "email": 8.9,  "house_number": 0.0},
+  "base":    {"ssn": 0.0,  "dob": 86.0, "phone": 0.0,  "email": null, "house_number": 100.0},
+  "loan":    {"ssn": 95.8, "dob": null, "phone": null, "email": null, "house_number": 0.0},
   "auto":    {"ssn": 0.0,  "dob": 0.0,  "phone": 15.1, "email": 0.0,  "house_number": 0.0},
   "tax":     {"ssn": 0.0,  "dob": 0.0,  "phone": 0.0,  "email": 0.0,  "house_number": 0.0}
 }
