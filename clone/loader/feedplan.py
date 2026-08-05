@@ -26,10 +26,27 @@ FEED_PLANS: tuple[FeedPlan, ...] = (
              "Export Utility Stripped Down/Utility_ky/Utility_ky.csv", None),
     FeedPlan("trace", "records_legacy",
              "Trace Skipping Oct 2025/2025_Historical_database_1/2025_Historical_database_1.csv", None),
-    # base spans both roots in production. feed_id_coverage proportions are
-    # ~1:7 toward records_new (USCRM + CoReg 18.6k sampled vs 2019.2_LF 130.6k).
-    FeedPlan("base", "records_legacy", "2026.1-USCRM/uscrm_ky.csv", None, weight=0.125),
-    FeedPlan("base", "records_new", "2019.2_USA_Consumer_LF/lf_ky.csv", "2026-01-15", weight=0.875),
+    # base spans both roots in production, whose feed_id_coverage volumes run
+    # ~1:7 toward records_new. WE DELIBERATELY INVERT THAT, and the reason is
+    # the whole point of the clone rather than a shortcut.
+    #
+    # base is our ONLY house_number-bearing feed, so it is our only source of
+    # resident-hop ANCHORS -- and the hop scans records_legacy exclusively.
+    # Production's anchor pool is not USCRM alone: it also draws on SSNxDOB,
+    # the 2014 phonebook and Historic Data, none of which we hold. Reproducing
+    # base's 1:7 VOLUME split while missing those three feeds therefore
+    # compounds anchor scarcity instead of mirroring production: measured on
+    # the 12 benchmark addresses, it left 20 of 22 base rows in records_new
+    # and just 2 usable anchors, so 10 of 12 addresses had none at all and the
+    # hop could not run.
+    #
+    # Volume proportion is cosmetic fidelity; ANCHOR DENSITY is behavioural,
+    # and it is what the coverage experiment measures. So base lands mostly in
+    # records_legacy, standing in for production's four legacy anchor feeds
+    # collectively, with a minority still on records_new so base remains
+    # reachable on both roots exactly as FEEDS declares.
+    FeedPlan("base", "records_legacy", "2026.1-USCRM/uscrm_ky.csv", None, weight=0.875),
+    FeedPlan("base", "records_new", "2019.2_USA_Consumer_LF/lf_ky.csv", "2026-01-15", weight=0.125),
     FeedPlan("loan", "records_new", "Payday_Big_2026/payday_ky.csv", "2026-02-15"),
     FeedPlan("auto", "records_new", "auto-verified/auto_ky.csv", "2026-03-15"),
     # MUST be inside [2026-03-01, 2026-04-01): feeds.py prunes the tax scan to

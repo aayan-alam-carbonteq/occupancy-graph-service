@@ -80,9 +80,12 @@ SHAPE_FIELDS: dict[str, tuple[str, str, str, str, str, str]] = {
 # not globally -- see src/occupancy_graph/source/search.py::_PhysicalTable.
 RECORD_ID_BASE = {"records_legacy": 1_000_000_000, "records_new": 7_000_000_000}
 
-# base spans both roots in production, ~1:7 toward records_new (the weight on
-# FeedPlan carries the intended share). Split deterministically by the row's
-# position in base.csv so the same row always lands on the same side.
+# base spans both roots. The split is deliberately weighted TOWARD legacy --
+# see the long note on the base FeedPlans in loader/feedplan.py: base is our
+# only anchor-bearing feed and the resident hop scans records_legacy only, so
+# production's 1:7 volume ratio would starve the anchors the coverage
+# experiment exists to measure. 1 row in 8 goes to records_new; the rest stay
+# legacy. Split by position so the same row always lands on the same side.
 BASE_LEGACY_MODULUS = 8
 
 # Columns population.py may DROP if already present. These arrive via
@@ -239,7 +242,7 @@ def _plan_rows(
     kept = 0
     for position, row in enumerate(read_shape_csv(path)):
         if plan.shape == "base":
-            to_legacy = position % BASE_LEGACY_MODULUS == 0
+            to_legacy = position % BASE_LEGACY_MODULUS != 0
             if (plan.table == "records_legacy") != to_legacy:
                 continue
         if limit_per_shape is not None and kept >= limit_per_shape:
