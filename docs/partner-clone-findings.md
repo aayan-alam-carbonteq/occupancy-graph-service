@@ -193,3 +193,73 @@ CLONE_DSN=... .venv/bin/python -m clone.compare_to_live
 # fidelity assertions (skipped without CLONE_DSN, so CI stays green)
 CLONE_DSN=... .venv/bin/python -m pytest tests/clone/test_clone_profile.py
 ```
+
+---
+
+## 8. The 12-address benchmark, clone vs production (2026-08-05)
+
+Same gold, same judge (`claude-sonnet-4-6`), same engine mode (`tools`), same
+model (`haiku-4-5`). The only variable is which database answered.
+
+**Gold set first.** Scoring against signals the partner corpus structurally
+cannot provide penalises the engine for data absence rather than reasoning, so
+signals grounded in absent feeds were removed —
+`benchmarks/gold-labels/mini_packet_signal_survey.superset.partner_corpus.json`
+in the `occupancy-engine` repo.
+
+The correction is smaller than expected, and the measurement says so:
+`criminal` and `linkedin` appear **nowhere** in the gold evidence; only `voter`
+does, across 15 signals. Of those, just **1** was wholly voter-dependent — the
+other 14 also cite feeds we hold, so dropping them outright would have credited
+the engine for missing things it can genuinely find. Only the 1 unanswerable
+signal was dropped; the other 14 kept, with their dead voter evidence stripped.
+**349 → 348 signals.**
+
+| family | signals | LIVE | CLONE | clone/live |
+|---|---|---|---|---|
+| property | 40 | 0.963 | 0.938 | **97%** |
+| owner | 69 | 0.884 | 0.812 | **92%** |
+| case | 146 | 0.473 | 0.356 | 75% |
+| subject | 77 | 0.487 | 0.377 | 77% |
+| portfolio | 8 | 0.625 | 0.500 | 80% |
+| legal | 4 | 0.250 | 0.500 | 200%¹ |
+| loan | 4 | 0.875 | 1.000 | 114%¹ |
+| **OVERALL** | **348** | **0.619** | **0.530** | **86%** |
+
+¹ n=4. Do not read these as the clone beating production; at that sample size a
+single signal swings the ratio.
+
+**The clone reproduces 86% of production's benchmark accuracy** — and the
+distribution matches the retrieval decomposition in §5 exactly:
+
+- **property 97%, owner 92%.** The assessor path retrieves at 100% (§5), and
+  these are the families that decide absentee ownership. This is the evidence
+  the product actually turns on, and it is very nearly production-grade locally.
+- **case 75%, subject 77%.** 223 of 348 signals, and both lean on the
+  utility/trace evidence the resident hop cannot fully reach — utility retrieval
+  is 15%, capped by holding 1 of production's 4 anchor feeds.
+
+### Cost of running it
+
+| | live corpus | clone |
+|---|---|---|
+| wall clock, 12 addresses | 51 min | **9.5 min** |
+| avg agent latency | 252 s | **47 s** |
+| LLM calls | 356 | 310 |
+| input tokens | 3.95 M | 2.95 M |
+| agent cost | $4.10 | **$2.97** |
+| credentials needed | partner DSN | none |
+
+Retrieval is essentially free locally (0.2 s vs 62 s), and the LLM work shrinks
+too because the hop surfaces less evidence to reason over — which is also why
+the accuracy is 86% rather than 100%. The two are the same fact seen twice.
+
+**Caveat on the run:** one packet (`subject_occupancy_surfaces` @ 1332 OX HILL
+DR) failed to grade with a `JudgeError` and is excluded from the clone's
+denominator. One of 84 packets, so the effect is small, but the clone figure is
+very slightly optimistic for that reason.
+
+**What the voter filter was worth:** almost nothing at the aggregate level
+(live went 0.629 unfiltered → 0.619 filtered, within judge variance), but
+`legal` moved 0.250 → 0.500 on the clone. The absent feeds were never the main
+story; the anchor thinness is.
