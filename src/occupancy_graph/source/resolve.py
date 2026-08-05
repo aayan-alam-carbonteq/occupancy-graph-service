@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from collections import Counter
 from dataclasses import dataclass, field
 
@@ -99,6 +100,23 @@ class ZipScanResult:
     state: str | None = None
 
 
+# When an address index EXISTS, the resident hop is unnecessary -- and it is
+# lossy, because it can only reach residents an anchor feed happens to name.
+#
+# `OCCUPANCY_LEGACY_SCAN=direct` selects the collapsed zip+address scan for
+# records_legacy instead. It is OFF by default because against the live partner
+# corpus that scan does not finish: `address` is unindexed there, so it becomes
+# a heap filter over the whole ZIP (~273k rows at ~195ms a cold page, observed
+# server-side ACTIVE at 14+ minutes without completing).
+#
+# It exists to answer the question the partner ask turns on -- "what do we get
+# back if the index we are requesting is added?" -- against the local clone,
+# where the index can simply be created. That is a question about ACCESS PATHS,
+# which transfer, not about latency, which does not.
+def _direct_legacy_scan_enabled() -> bool:
+    return os.environ.get("OCCUPANCY_LEGACY_SCAN", "").strip().lower() == "direct"
+
+
 async def scan_zip_sources(pool: PartnerPool, query: AddressQuery) -> ZipScanResult:
     result = ZipScanResult(rows_by_shape={shape: [] for shape in ZIP_SHAPES})
     if not query.raw:
@@ -122,7 +140,7 @@ async def scan_zip_sources(pool: PartnerPool, query: AddressQuery) -> ZipScanRes
         groups = pattern_groups(ZIP_SHAPES, table)
         if not groups:
             continue
-        if table == "records_legacy":
+        if table == "records_legacy" and not _direct_legacy_scan_enabled():
             # The zip+address heap filter does not finish on this table
             # (observed active at 14+ min). Reach rows via the residents
             # instead -- indexed equalities only. See _scan_legacy_via_residents.

@@ -263,3 +263,83 @@ very slightly optimistic for that reason.
 (live went 0.629 unfiltered → 0.619 filtered, within judge variance), but
 `legal` moved 0.250 → 0.500 on the clone. The absent feeds were never the main
 story; the anchor thinness is.
+
+---
+
+## 9. The address index recovers the SQLite-era accuracy — and prices the partner ask
+
+The SQLite graph scored **0.815** on these *exact same rows*. The clone with the
+resident hop scored 0.530. Identical data, 0.285 apart — so the loss was never
+data, it was the **access path**. SQLite modelled addresses as first-class keys
+(`addresses` 354,992 rows, `address_edges` 2.4 M) and retrieved directly. The
+partner schema has `address` as unindexed free text, forcing the lossy hop.
+
+The clone is ours, so the index the partner ask requests can simply be created:
+
+```sql
+CREATE INDEX idx_records_legacy_zip_addr
+  ON public.records_legacy (zip, upper(address) varchar_pattern_ops);
+```
+
+Then `OCCUPANCY_LEGACY_SCAN=direct` selects the collapsed zip+address scan
+instead of the hop. Same gold, same judge, same engine mode, same model:
+
+| family | signals | LIVE (hop) | clone (hop) | clone **+ index** | gain |
+|---|---|---|---|---|---|
+| case | 146 | 0.473 | 0.356 | **0.784** | +0.428 |
+| subject | 77 | 0.487 | 0.377 | **0.955** | +0.578 |
+| owner | 69 | 0.884 | 0.812 | **0.978** | +0.167 |
+| property | 40 | 0.963 | 0.938 | **1.000** | +0.062 |
+| portfolio | 8 | 0.625 | 0.500 | 0.500 | — |
+| loan | 4 | 0.875 | 1.000 | 1.000 | — |
+| legal | 4 | 0.250 | 0.500 | 0.500 | — |
+| **OVERALL data** | **348** | **0.619** | **0.530** | **0.878** | **+0.348** |
+| **reasoning** | | 0.598 | 0.552 | **0.760** | **+0.208** |
+
+**0.878 against the SQLite era's 0.815 — the target is met and exceeded**, on
+the same rows, through the partner schema.
+
+### What this establishes
+
+1. **The data was always sufficient for 0.8+.** Every point between 0.530 and
+   0.878 was locked behind an access path, not missing evidence. The clone did
+   not need more data; it needed a way to reach what it had.
+2. **The partner ask now has a price tag.** An index on `(zip, address)` is
+   worth **+0.348 data coverage** over the hop, and **+0.259 over the live
+   corpus today**. The §4.1 ask stops being "our workaround is lossy, please
+   help" and becomes "this index recovers a third of our benchmark accuracy."
+3. **The resident hop is a workaround, and this is its cost.** It was built
+   because the unindexed scan does not finish in production. It works, and it
+   costs ~0.35 coverage — quantified rather than asserted.
+4. **The gains land exactly where the hop was lossy.** `subject` +0.578 and
+   `case` +0.428 are the families that lean on utility/trace, which the hop
+   reached at 15%. `property` was already 0.938 and moves only to 1.000, because
+   the assessor path never went through the hop at all. The accuracy table and
+   the retrieval table in §5 are the same finding measured two ways.
+5. **`portfolio`/`legal`/`loan` do not move** — they are not address-scan bound.
+   Their remaining gap is content (`drive.csv` empty at these addresses) and
+   absent feeds, which no index fixes.
+
+### What it costs
+
+| | clone + hop | clone + index |
+|---|---|---|
+| avg agent latency | 47.3 s | 61.7 s |
+| LLM calls | 310 | 333 |
+| input tokens | 2.95 M | 3.66 M |
+| agent cost | $2.97 | **$3.72** |
+
++25% tokens and +25% cost to retrieve what the hop was missing. Cheap for
++0.348 coverage.
+
+### The honest limit on this result
+
+`OCCUPANCY_LEGACY_SCAN=direct` is **off by default** and must stay that way.
+Against the live corpus that scan does not finish — `address` is unindexed
+there, so it degenerates into a heap filter over the whole ZIP (~273k rows at
+~195 ms a cold page, observed ACTIVE at 14+ minutes). This measures what
+production *would* score **if the index existed**, which is exactly the question
+the ask turns on. It is not a claim about production today.
+
+Latency here is meaningless (2.36 M rows in RAM). **Plan shape and retrieval
+completeness transfer; timings do not.**
