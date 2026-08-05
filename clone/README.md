@@ -216,3 +216,58 @@ and would silently lose rows in production too.
 
 **Exact parity is not reachable from these CSVs.** It needs an extract taken
 *from* the partner corpus — option §4.4 in `2026-08-04-partner-ask.md`.
+
+---
+
+## How accurate is the clone, really? (2026-08-05)
+
+**The CSVs are a SUBSET OF THE PARTNER CORPUS, not an independent extraction.**
+Verified by pulling the same people out of production over the indexed
+`(last_name, zip)` path: every resident our CSVs place at 1104 SPRING RUN RD is
+present in production at the same address, in the same feeds, with matching
+fields. This overturned an earlier assumption here and changed what the loader
+should do.
+
+`python -m clone.parity_check` measures it at row level:
+
+```
+clone rows that exist IDENTICALLY in production   83.3%  (15/18)
+production rows the clone reproduces              46.9%  (15/32)
+```
+
+Two separate facts. The first: what we hold is genuinely production's data. The
+second: we hold under half of what production holds at these addresses.
+
+### What that changed
+
+**Down-sampling was removed.** `dob`/`phone`/`email` were being sampled toward
+`feed_id_coverage`'s NATIONAL per-feed averages. Since a CSV value *is*
+production's value, that could only move the clone away from production — and it
+was measurably deleting real data (`TAMIE WORTHINGTON dob=1968-01-01`, present in
+production, removed by the sampler). They are now carried verbatim, and those
+rows are byte-identical to production.
+
+Only two columns remain loader-controlled, both for reasons that survive the
+finding: **`ssn`** (our CSVs carry none, so it must be synthesised — and its rate
+is what makes the entity graph skew to `records_new` and leave tax unlinked,
+emergently) and **`house_number`** (our CSVs carry it where production has NULL,
+an artifact of the old cleaning pipeline; gating it to base/USCRM restores
+production's reality and is the resident hop's only anchor).
+
+### The date coercion is faithful, not lossy
+
+The loader drops 99,540 unparseable `dob` values. All are of the form `YYYY0000`
+— year-only, month and day zeroed, not a date at all. We parse **93.4%** of
+utility dobs; production's utility `dob` population is **93.9%**. Within half a
+point, so production discards the same garbage. Dropping rather than guessing is
+reproducing production's behaviour.
+
+### What still cannot be closed with this data
+
+- **Three anchor feeds are absent** — `2014 US Phonebook`, `Historic Data
+  17-Nov-2025`, `SSNxDOB`. The raw source is `Lexington_11DB (Uc+Au+Tx+Tr+Ln+Dr+
+  Cr+Li+Vo)`; those feeds were never in it. This is what caps `utility` retrieval
+  at 15% (33 rows across 20 surnames at 1057 SPRING RUN RD, but 1 anchor surname).
+- **`drive.csv` has zero rows** at any of the 12 benchmark addresses.
+- Closing either needs an extract taken *from* the partner corpus — §4.4 of
+  `2026-08-04-partner-ask.md`.
