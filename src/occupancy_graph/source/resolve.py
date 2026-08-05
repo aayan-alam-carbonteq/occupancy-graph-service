@@ -332,15 +332,42 @@ async def _scan_legacy_via_residents(
             names = names[:MAX_NAME_HOPS]
 
         for name in names:
+            # THE ADDRESS FILTER BELONGS IN THE QUERY, NOT AFTER IT.
+            #
+            # This used to select on (last_name, zip) alone and apply
+            # matches_prefix in Python. That silently lost rows whenever a
+            # surname was common in the ZIP: LIMIT bounds the SURNAME's rows
+            # across the whole ZIP, so the handful at the subject address were
+            # frequently not in the slice fetched. Measured on the local clone,
+            # ZIP 40517: COX has 585 rows of which 5 are at the subject address,
+            # MARTIN has 1,147 of which 0 are -- so a 400-row window spent
+            # almost all of its budget on other streets and the hop returned 15%
+            # of the utility rows that were sitting right there. Both surnames
+            # logged the cap warning, which is what exposed it.
+            #
+            # This is NOT a clone artefact -- the same truncation happens live,
+            # and more often, since production's ZIPs are denser.
+            #
+            # The access path is unchanged: (last_name, zip, house_number) still
+            # drives the scan, and `address ILIKE` is a heap filter over that
+            # surname's few hundred rows rather than over the ZIP's ~273k. It is
+            # the same predicate the collapsed zip scan cannot afford, made cheap
+            # by the index having already cut the candidate set by three orders
+            # of magnitude.
             hop = await conn.fetch(
                 f"SELECT * FROM public.records_legacy"
-                f" WHERE last_name = $1 AND zip = $2 LIMIT {NAME_HOP_LIMIT}",
-                name, query.zip5,
+                f" WHERE last_name = $1 AND zip = $2 AND address ILIKE $3"
+                f" LIMIT {NAME_HOP_LIMIT}",
+                name, query.zip5, query.like_prefix,
             )
             if len(hop) == NAME_HOP_LIMIT:
-                logger.warning("resident hop: surname %r hit the %d-row cap in zip %s; "
-                               "rows beyond it are not seen", name, NAME_HOP_LIMIT, query.zip5)
+                logger.warning("resident hop: surname %r hit the %d-row cap AT the "
+                               "subject address in zip %s; rows beyond it are not seen",
+                               name, NAME_HOP_LIMIT, query.zip5)
             for r in hop:
+                # Defence in depth: ILIKE treats `_` as a single-char wildcard
+                # while matches_prefix treats it literally, so the Python check
+                # stays as the narrower of the two.
                 if query.matches_prefix(r["address"]):
                     rows_by_id.setdefault(r["record_id"], dict(r))
 
