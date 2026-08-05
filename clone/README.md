@@ -174,3 +174,45 @@ Two **independent** causes, and both matter:
    diverge, and it is why `tax` is the one column where the clone sometimes *exceeds* live.
 
 Do not attribute every difference to the hop.
+
+### Why retrieval is not identical to production — decomposed
+
+`clone_shim / clone_content` is a **mechanism** number (what the shim recovers of
+what is actually there). `clone_content vs live_shim` is a **data** number. Only
+the first is something the loader or the shim can fix.
+
+| shape | clone content | clone shim | retrieval | live shim | content vs live |
+|---|---|---|---|---|---|
+| loan | 11 | 11 | **100%** | 55 | 20% |
+| auto | 4 | 4 | **100%** | 11 | 36% |
+| tax | 17 | 17 | **100%** | 18 | 94% |
+| base | 22 | 24 | 109%¹ | 34 | 65% |
+| trace | 64 | 57 | 89% | 118 | 54% |
+| utility | 189 | 29 | **15%** | 60 | 315% |
+| drive | (= loan) | 0 | n/a | 30 | **0%** |
+
+¹ >100% because base spans both roots and the shim counts both.
+
+**Retrieval is exact wherever the hop is not involved.** Every `records_new`
+shape recovers 100% of what the clone holds, so their gap against live is purely
+that the Lexington CSVs are a different extraction — not a retrieval defect.
+
+**`utility` at 15% is the anchor-diversity ceiling, and it is structural.** At
+1057 SPRING RUN RD the clone holds 33 utility rows across **20 distinct
+surnames** but only **1 anchor surname**. The hop can only reach residents it can
+name, and with one anchor feed where production has four, it names 1-2 people
+where 6-20 live there. `MAX_NAME_HOPS` (8) is nowhere near binding. No loader
+change fixes this; only the missing anchor feeds would.
+
+**`drive` at 0 is content absence, proven not inferred:** `drive.csv` contains
+**zero rows** at any of the 12 benchmark addresses, so no join key can recover
+licences that do not exist in the source.
+
+**What WAS fixable has been fixed** — two real bugs found by this comparison:
+the base split starving anchors (`loader/feedplan.py`), and the name hop applying
+its address filter after the LIMIT rather than inside the query
+(`src/occupancy_graph/source/resolve.py`), which cost trace 11 points of recall
+and would silently lose rows in production too.
+
+**Exact parity is not reachable from these CSVs.** It needs an extract taken
+*from* the partner corpus — option §4.4 in `2026-08-04-partner-ask.md`.
