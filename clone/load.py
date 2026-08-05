@@ -88,9 +88,35 @@ RECORD_ID_BASE = {"records_legacy": 1_000_000_000, "records_new": 7_000_000_000}
 # legacy. Split by position so the same row always lands on the same side.
 BASE_LEGACY_MODULUS = 8
 
-# Columns population.py may DROP if already present. These arrive via
-# mapping.py, so this list only ever REMOVES.
-OPTIONAL_POPULATION_COLUMNS = ("dob", "phone", "email")
+# DELIBERATELY EMPTY. Do not re-add dob/phone/email here.
+#
+# These columns are NOT down-sampled, because the Lexington CSVs are a
+# SUBSET OF THE PARTNER CORPUS -- not an independent extraction. Verified
+# 2026-08-05 by pulling the same people out of production over the indexed
+# (last_name, zip) path: the residents our CSVs place at 1104 SPRING RUN RD
+# are present in production at the same address, in the same feeds, and the
+# rows match field for field:
+#
+#   production  KENNETH WORTHINGTON  dob=1965-01-01  phone=6062240200
+#   clone       KENNETH WORTHINGTON  dob=1965-01-01  phone=6062240200
+#   production  TAMIE   WORTHINGTON  dob=1968-01-01  phone=6062240200
+#   clone       TAMIE   WORTHINGTON  dob=(DELETED)   phone=6062240200   <-- us
+#
+# The only divergence found was a real dob this sampler had removed. Its
+# whole premise -- that our population had to be calibrated toward
+# production's per-feed averages -- assumed a different extraction. Since the
+# values ARE production's values, sampling them can only move the clone away
+# from production, never toward it. feed_id_coverage is also a NATIONAL
+# average, so calibrating a Lexington subset against it imported a second
+# error on top of the first.
+#
+# Still synthesised/gated, for reasons that remain valid:
+#   ssn          our CSVs carry NONE, so it must be synthesised (below)
+#   house_number our CSVs carry it on trace/auto/tax where production has it
+#                NULL -- an artifact of the old cleaning pipeline parsing it
+#                out of the address, not something production holds. Gating
+#                it to base/USCRM restores production's reality.
+OPTIONAL_POPULATION_COLUMNS: tuple[str, ...] = ()
 
 # house_number is LOADER-OWNED, not manifest-driven, and that distinction is
 # load-bearing.
