@@ -135,9 +135,21 @@ paths run.
 
 | group | addresses | recall |
 |---|---|---|
-| **≥1 surviving anchor** — the hop's true recall | 2 / 12 | **31.6%** (27.8%, 35.0%) |
-| **0 surviving anchors** — the anchor-coverage problem | 10 / 12 | 0.0% |
-| blended | 12 | 4.7% |
+| **≥1 surviving anchor** — the hop's true recall | 11 / 12 | **39.1%** (100/256) |
+| **0 surviving anchors** — the anchor-coverage problem | 1 / 12 | 0.0% |
+| blended | 12 | 36.4% |
+
+Per-address recall ranges from **4.5%** (1332 OX HILL DR) to **84.2%** (2812 RED
+LEAF DR). That spread *is* the finding: recall depends on whether the anchor's
+resident happens to be the same person the utility/trace rows name, which varies
+address by address. A single average would hide it.
+
+An earlier load reported 31.6% across only 2 addresses, because the base split
+was weighted 1:7 toward `records_new` to mirror production's feed VOLUME — which
+left just 2 usable anchors across all 12 addresses. base is our only
+anchor-bearing feed and the hop scans `records_legacy` only, so that ratio
+starved the very thing being measured. See the note on the base FeedPlans in
+`loader/feedplan.py`.
 
 **Read the split, never the blend.** The blended 4.7% describes anchor availability, not the hop.
 Where the hop has any resident to work from it recovers ~32% of what a full scan finds; where it has
