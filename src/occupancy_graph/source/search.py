@@ -26,7 +26,6 @@ from collections.abc import Mapping, Sequence
 from typing import Any, NamedTuple
 
 import asyncpg
-
 from occupancy_graph.source.pool import PartnerPool
 from occupancy_graph.source.resolve import decode_raw_data
 
@@ -66,6 +65,27 @@ PHYSICAL_TABLES = {
     # route it to the real parent rather than to a relation that would raise.
     "records_partitioned": _PhysicalTable("public.records_new", "partitioned"),
 }
+
+
+async def physical_record(
+    pool: PartnerPool, source_table: str, record_id: int
+) -> list[dict[str, Any]]:
+    """Fetch a physical partner row by its stable table-local identifier.
+
+    The table name is validated against PHYSICAL_TABLES before a module-owned
+    relation literal is interpolated. LIMIT 2 lets the HTTP layer distinguish a
+    missing row from a broken uniqueness assumption without materializing more.
+    """
+    physical = PHYSICAL_TABLES.get(source_table)
+    if physical is None or source_table == "records_partitioned":
+        raise ValueError(
+            f"unknown physical source table {source_table!r}; expected "
+            "records_new or records_legacy"
+        )
+    sql = f"SELECT * FROM {physical.relation} WHERE record_id = $1 LIMIT 2"
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(sql, record_id)
+    return [decode_raw_data(dict(row)) for row in rows]
 
 # Ceiling on links followed per person. 200 rows of one shape is already the
 # scan budget (resolve.MAX_ROWS_PER_SHAPE); a person with more links than this

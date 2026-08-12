@@ -12,15 +12,14 @@ from __future__ import annotations
 import contextlib
 from collections.abc import AsyncIterator
 
+from occupancy_graph.service import handlers
+from occupancy_graph.source.bundle import BundleCache
+from occupancy_graph.source.pool import PartnerPool
 from starlette.applications import Starlette
 from starlette.exceptions import HTTPException
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.routing import Route
-
-from occupancy_graph.service import handlers
-from occupancy_graph.source.bundle import BundleCache
-from occupancy_graph.source.pool import PartnerPool
 
 
 async def _http_exception(request: Request, exc: HTTPException) -> JSONResponse:
@@ -67,6 +66,11 @@ def create_app(*, pool: PartnerPool | None = None, cache: BundleCache | None = N
         Route("/v1/people/search", handlers.people_search, methods=["GET"]),
         Route("/v1/person/{person_id}/records", handlers.person_records, methods=["GET"]),
         Route("/v1/source-record/{shape}/{rowid:int}", handlers.source_record, methods=["GET"]),
+        Route(
+            "/v1/sql/source-record/{source_table}/{record_id}",
+            handlers.sql_source_record,
+            methods=["GET"],
+        ),
         Route("/v1/sql", handlers.run_sql, methods=["POST"]),
     ]
     app = Starlette(
