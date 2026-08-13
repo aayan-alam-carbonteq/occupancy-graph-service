@@ -7,9 +7,6 @@ from __future__ import annotations
 
 from typing import Any
 
-from starlette.requests import Request
-from starlette.responses import JSONResponse
-
 from occupancy_graph.service import records as records_mod
 from occupancy_graph.service import sql_hatch
 from occupancy_graph.service.jsonio import jsonable
@@ -24,6 +21,8 @@ from occupancy_graph.source.manifest import SHAPES
 from occupancy_graph.source.people import PERSON_ID_PREFIX, people_for_bundle
 from occupancy_graph.source.project import project_row
 from occupancy_graph.source.search import HAL_ID_PREFIX
+from starlette.requests import Request
+from starlette.responses import JSONResponse
 
 # The keys a person carries on the wire. `sources` is a set internally and
 # `rows` is the internal row list -- neither may leak in that form.
@@ -412,6 +411,50 @@ async def source_record(request: Request) -> JSONResponse:
             "record_id": row.get("id") or row.get(f"{shape}_id"),
             "summary": records_mod.summarize(shape, row),
             "data": dict(row),
+        }
+    )
+
+
+async def sql_source_record(request: Request) -> JSONResponse:
+    """Hydrate one SQL discovery into concise, physical-schema provenance."""
+    source_table = str(request.path_params["source_table"])
+    raw_record_id = str(request.path_params["record_id"])
+    if source_table not in {"records_new", "records_legacy"}:
+        return error(
+            404,
+            f"unknown physical source table {source_table!r}; expected "
+            "records_new or records_legacy",
+        )
+    try:
+        record_id = int(raw_record_id)
+    except ValueError:
+        return error(400, f"record_id must be an integer, got {raw_record_id!r}")
+
+    rows = await search.physical_record(request.app.state.pool, source_table, record_id)
+    if not rows:
+        return error(404, f"no {source_table} row with record_id {record_id}")
+    if len(rows) != 1:
+        return error(
+            409,
+            f"record_id {record_id} is not unique within {source_table}",
+        )
+
+    row = rows[0]
+    data = {key: value for key, value in row.items() if value is not None}
+    summary_fields = [
+        f"{key}={data[key]}"
+        for key in ("first_name", "last_name", "address", "city", "state", "zip")
+        if data.get(key) not in (None, "")
+    ]
+    return ok(
+        {
+            "source": "partner_sql",
+            "table": source_table,
+            "rowid": None,
+            "record_id": str(record_id),
+            "source_file": str(row.get("source_file") or ""),
+            "summary": "; ".join(summary_fields)[:500],
+            "data": data,
         }
     )
 
