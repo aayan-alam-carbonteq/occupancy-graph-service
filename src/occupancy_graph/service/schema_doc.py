@@ -85,18 +85,34 @@ TABLES = [
 # back to the row of this table that explains what ssn actually costs.
 ACCESS_PATHS = [
     {
-        "predicate": "zip = $1 AND address ILIKE 'N STREET%'",
+        "predicate": (
+            "zip = $1 AND silver.s5_street_norm(address) "
+            "LIKE silver.s5_street_norm($2) || '%'"
+        ),
         "table": "public.records_new",
-        "index": "per-partition zip btree",
-        "measured": "173 ms warm, 24 k rows examined",
-        "hint_key": "zip",
+        "index": "idx_records_new_zip_normaddr (per-partition)",
+        "measured": (
+            "59 ms across all five partitions. WRITE THE PREDICATE EXACTLY AS "
+            "SHOWN: the index is on the EXPRESSION silver.s5_street_norm(address), "
+            "so `address ILIKE $2` cannot use it and will be refused as a scan. "
+            "Wrap the parameter in the function too -- that is what makes 'MAIN "
+            "STREET' find a stored 'MAIN ST'."
+        ),
+        "hint_key": "(zip, s5_street_norm(address))",
     },
     {
-        "predicate": "zip = $1 AND address ILIKE 'N STREET%'",
+        "predicate": (
+            "zip = $1 AND silver.s5_street_norm(address) "
+            "LIKE silver.s5_street_norm($2) || '%'"
+        ),
         "table": "public.records_legacy",
-        "index": "idx_records_zip",
-        "measured": "1.30 s warm / 32 s cold, 272 916 rows examined",
-        "hint_key": "zip",
+        "index": "idx_records_legacy_zip_normaddr",
+        "measured": (
+            "554 ms warm on a 6.24 B-row table. The prefix must be ANCHORED "
+            "(trailing % only): a leading % makes the range scan impossible and "
+            "the query degenerates to a full-ZIP heap read, which does not finish."
+        ),
+        "hint_key": "(zip, s5_street_norm(address))",
     },
     {
         "predicate": "last_name = $1 AND zip = $2",
@@ -106,10 +122,20 @@ ACCESS_PATHS = [
         "hint_key": "(last_name, zip, house_number)",
     },
     {
-        "predicate": "upper(state) = $1 AND upper(city) = $2 AND address ILIKE 'N STREET%'",
-        "table": "public.records_new",
-        "index": "(upper(state), upper(city))",
-        "measured": "613 ms warm / 53 s cold, 151 507 rows examined. The ONLY path to tax.",
+        "predicate": (
+            "upper(state) = $1 AND upper(city) = $2 AND silver.s5_street_norm(address) "
+            "LIKE silver.s5_street_norm($3) || '%' AND source_file LIKE 'property_owner%'"
+        ),
+        "table": "public.records_new (prunes to records_partitioned_p20260301)",
+        "index": "idx_p20260301_property_owner_addr (PARTIAL)",
+        "measured": (
+            "26 ms, down from 613 ms warm / 53 s cold. The ONLY path to tax -- "
+            "property_owner rows have zip 0% populated. The index is PARTIAL on "
+            "source_file LIKE 'property_owner%', so that clause is required for "
+            "the planner to use it; drop it and this reverts to a 19 s - 241 s "
+            "scan. Constrain imported_at to 2026-03-01 .. 2026-04-01 to prune to "
+            "the single partition holding the feed."
+        ),
         "hint_key": "(upper(state), upper(city))",
     },
     {
@@ -166,8 +192,11 @@ CAVEATS = [
     "~17.5% of property_owner rows are column-shifted",
     "imported_at is a load date, not an observation date",
     # The rest, all measured.
-    "There is NO index on the free-text address, on latitude/longitude, on "
-    "source_file, or on raw_data. Predicating on any of them scans.",
+    "The free-text address IS reachable, but ONLY through "
+    "silver.s5_street_norm(address) with an anchored LIKE prefix -- that "
+    "expression is what the indexes are built on. A bare `address ILIKE ...`, "
+    "`address = ...`, or a leading-% pattern uses no index and scans. There is "
+    "still NO index on latitude/longitude, on source_file, or on raw_data.",
     "source_file is the only feed identity and it is unindexed -- always pair it "
     "with an indexed predicate, never use it as the driving condition.",
     "records_new's partitions are separate DATASETS, not time slices: "

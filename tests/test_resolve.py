@@ -43,12 +43,12 @@ def test_address_query_normalizes_and_extracts_the_prefix():
     query = AddressQuery.build("1104 Spring Run Road", "40514-1046")
     assert query.norm_address == "1104 SPRING RUN RD"
     assert query.zip5 == "40514"
-    assert query.like_prefix == "1104 Spring%"
+    assert query.address_prefix == "1104 Spring"
 
 
 def test_address_query_without_a_house_number_falls_back_to_the_whole_string():
     query = AddressQuery.build("Esther St", "02920")
-    assert query.like_prefix == "Esther St%"
+    assert query.address_prefix == "Esther St"
 
 
 def test_address_query_prefix_excludes_the_unit_designator():
@@ -57,12 +57,12 @@ def test_address_query_prefix_excludes_the_unit_designator():
     # including it risks silently losing rows rather than merely being less
     # selective.
     query = AddressQuery.build("123 Main St Apt 4", "40505")
-    assert query.like_prefix == "123 Main%"
+    assert query.address_prefix == "123 Main"
 
 
 def test_address_query_recognizes_an_alphanumeric_house_number():
     query = AddressQuery.build("12A Oak Ct", "40505")
-    assert query.like_prefix == "12A Oak%"
+    assert query.address_prefix == "12A Oak"
 
 
 async def test_scan_of_an_empty_address_returns_empty_without_querying(pool):
@@ -89,11 +89,7 @@ async def test_scan_truncates_a_multi_table_shape_to_the_shape_budget(monkeypatc
         # `base` feed name rather than an arbitrary marker.
         return [{"source_file": "2026.1-USCRM/a.csv", "table": table}]
 
-    async def _fake_residents(pool, query):
-        return [{"source_file": "2026.1-USCRM/a.csv", "table": "records_legacy"}]
-
     monkeypatch.setattr(resolve_module, "_scan_table", _fake_scan_table)
-    monkeypatch.setattr(resolve_module, "_scan_legacy_via_residents", _fake_residents)
 
     result = await scan_zip_sources(None, AddressQuery.build("123 Main St", "40505"))
     assert len(result.rows_by_shape["base"]) == 1
@@ -122,9 +118,8 @@ async def test_scan_majority_vote_prefers_the_common_city_over_a_stray_row(monke
     per-shape row counts other tests assert against that same corpus."""
 
     async def _fake_scan_table(pool, table, groups, query):
-        return []
-
-    async def _fake_residents(pool, query):
+        if table != "records_legacy":
+            return []
         return [
             {"source_file": "Export Utility Stripped Down/a.csv",
              "city": "LEXINGTON", "state": "KY"},
@@ -135,7 +130,6 @@ async def test_scan_majority_vote_prefers_the_common_city_over_a_stray_row(monke
         ]
 
     monkeypatch.setattr(resolve_module, "_scan_table", _fake_scan_table)
-    monkeypatch.setattr(resolve_module, "_scan_legacy_via_residents", _fake_residents)
 
     result = await scan_zip_sources(None, AddressQuery.build("123 Main St", "40505"))
     assert result.city == "LEXINGTON"
@@ -143,9 +137,8 @@ async def test_scan_majority_vote_prefers_the_common_city_over_a_stray_row(monke
 
 async def test_scan_city_vote_tie_break_is_alphabetical_and_deterministic(monkeypatch):
     async def _fake_scan_table(pool, table, groups, query):
-        return []
-
-    async def _fake_residents(pool, query):
+        if table != "records_legacy":
+            return []
         return [
             {"source_file": "Export Utility Stripped Down/a.csv",
              "city": "ZZZTOWN", "state": "KY"},
@@ -154,7 +147,6 @@ async def test_scan_city_vote_tie_break_is_alphabetical_and_deterministic(monkey
         ]
 
     monkeypatch.setattr(resolve_module, "_scan_table", _fake_scan_table)
-    monkeypatch.setattr(resolve_module, "_scan_legacy_via_residents", _fake_residents)
 
     query = AddressQuery.build("123 Main St", "40505")
     results = [(await scan_zip_sources(None, query)).city for _ in range(5)]
@@ -346,32 +338,23 @@ async def test_phase_one_issues_one_scan_per_table_not_one_per_shape(monkeypatch
 
     Six ZIP shapes span two tables, so the old loop issued SEVEN scans
     (utility, trace, base x2 tables, loan, drive, auto). Every one of them
-    carried the identical indexed predicate -- same ZIP, same address prefix --
-    and only `zip` is indexed, so each re-read the whole ZIP off disk to
-    evaluate the unindexed address/source_file filters. On records_legacy that
-    was the same heap read three times over, and it is where the time went:
-    the backend sits at 100% IO/DataFileRead on the live corpus.
+    carried the identical predicate -- same ZIP, same address prefix -- and
+    therefore re-read the identical rows to evaluate the unindexed source_file
+    filter. On records_legacy that was the same read three times over.
 
-    Two tables must therefore mean exactly two scans."""
+    Two tables must mean exactly two scans -- and BOTH must be _scan_table.
+    records_legacy used to divert to a resident hop; that divergence is gone,
+    so this also pins that every table takes the one indexed path."""
     table_calls: list[str] = []
-    resident_calls: list[str] = []
 
     async def _fake_scan_table(pool, table, groups, query):
         table_calls.append(table)
         return []
 
-    async def _fake_residents(pool, query):
-        resident_calls.append("records_legacy")
-        return []
-
     monkeypatch.setattr(resolve_module, "_scan_table", _fake_scan_table)
-    monkeypatch.setattr(resolve_module, "_scan_legacy_via_residents", _fake_residents)
     await scan_zip_sources(None, AddressQuery.build("123 Main St", "40505"))
 
-    # records_legacy goes through the resident hop (its zip scan does not
-    # finish on the live corpus); records_new keeps the collapsed table scan.
-    assert resident_calls == ["records_legacy"]
-    assert table_calls == ["records_new"]
+    assert table_calls == ["records_legacy", "records_new"]
 
 
 def test_loan_and_drive_are_one_group_because_they_are_the_same_rows():
@@ -417,25 +400,32 @@ def test_collapsed_sql_never_interpolates_partner_text():
         assert pattern not in sql, f"{pattern!r} was interpolated instead of bound"
 
 
-# --- The resident hop: records_legacy without the unindexed address filter ---
+# --- records_legacy through the address index (formerly the resident hop) ---
+#
+# These three assertions predate the cutover and are kept deliberately. They
+# were written against the resident hop, which reached rows indirectly through
+# named residents; the direct indexed scan must satisfy every one of them for
+# the SAME rows, or the cutover lost coverage it claimed to gain. The fourth
+# test in this group -- the hop's no-house-number fallback -- tested a function
+# that no longer exists and is gone with it.
 
 
-async def test_resident_hop_recovers_shape_rows_their_anchor_cannot_reach(pool):
-    """THE SHIM'S REASON TO EXIST, against real Postgres. The utility row (Pat
-    Tenant) and second trace row (John Smith) have house_number NULL -- the
-    production structure -- so the anchor scan cannot touch them. They must
-    arrive via the (last_name, zip) hop through their anchor rows."""
+async def test_scan_reaches_rows_whose_house_number_is_null(pool):
+    """The utility row (Pat Tenant) and second trace row (John Smith) have
+    house_number NULL -- the production structure. The hop could only reach them
+    through a resident it could name; the address index reaches them directly.
+    Either way they must arrive, and this is the assertion that says so."""
     result = await scan_zip_sources(pool, AddressQuery.build("123 Main St", "40505"))
     utility_ids = {r["record_id"] for r in result.rows_by_shape["utility"]}
     trace_ids = {r["record_id"] for r in result.rows_by_shape["trace"]}
-    assert 1001 in utility_ids   # Tenant: reachable ONLY through anchor 1903
-    assert 1003 in trace_ids     # Smith: reachable ONLY through anchor 1902
+    assert 1001 in utility_ids
+    assert 1003 in trace_ids
 
 
-async def test_resident_hop_excludes_the_same_house_number_on_another_street(pool):
-    """House 123 exists on other streets in the ZIP. The anchor scan matches on
-    (zip, house_number) alone, so the address prefix filter -- now client-side
-    -- is what keeps 123 ELM ST out of a 123 MAIN ST investigation."""
+async def test_scan_excludes_the_same_house_number_on_another_street(pool):
+    """House 123 exists on other streets in the ZIP. The address prefix -- now
+    an index condition rather than a client-side filter -- is what keeps
+    123 ELM ST out of a 123 MAIN ST investigation."""
     result = await scan_zip_sources(pool, AddressQuery.build("123 Elm St", "40505"))
     for shape, rows in result.rows_by_shape.items():
         for row in rows:
@@ -443,27 +433,35 @@ async def test_resident_hop_excludes_the_same_house_number_on_another_street(poo
                 f"{shape} row {row['record_id']} belongs to 123 MAIN ST")
 
 
-async def test_resident_hop_anchor_only_rows_do_not_become_shape_rows(pool):
-    """Anchor feeds (SSNxDOB, phonebook) are not in FEEDS, so anchor rows that
-    match no pattern must vanish after shape assignment rather than leak into
-    a shape as unclassified rows."""
+async def test_non_feed_rows_do_not_become_shape_rows(pool):
+    """Anchor feeds (SSNxDOB, phonebook) are not in FEEDS. Their rows sit at the
+    subject address and the index returns them, so the source_file filter is the
+    only thing keeping them out of a shape as unclassified rows."""
     result = await scan_zip_sources(pool, AddressQuery.build("123 Main St", "40505"))
     all_ids = {r["record_id"] for rows in result.rows_by_shape.values() for r in rows}
     assert {1901, 1902, 1903}.isdisjoint(all_ids)
 
 
-async def test_resident_hop_without_a_house_number_falls_back_to_the_zip_scan(monkeypatch):
-    """"Esther St" has no house number to anchor on. The hop must fall back to
-    the collapsed zip scan -- slow but correct -- rather than silently
-    returning nothing for a resolvable address."""
-    calls = []
+async def test_scan_normalizes_suffix_spelling_on_both_sides(pool):
+    """s5_street_norm is applied to the COLUMN and the PARAMETER, so a query
+    spelling a suffix out in full must reach a row that abbreviates it. This is
+    the capability the raw ILIKE prefix never had, and the reason the predicate
+    may not be simplified back."""
+    spelled = await scan_zip_sources(pool, AddressQuery.build("123 Main Street", "40505"))
+    abbreviated = await scan_zip_sources(pool, AddressQuery.build("123 Main St", "40505"))
+    spelled_ids = {r["record_id"] for rows in spelled.rows_by_shape.values() for r in rows}
+    abbreviated_ids = {
+        r["record_id"] for rows in abbreviated.rows_by_shape.values() for r in rows
+    }
+    assert spelled_ids == abbreviated_ids
+    assert spelled_ids
 
-    async def _fake_scan_table(pool, table, groups, query):
-        calls.append(table)
-        return []
 
-    monkeypatch.setattr(resolve_module, "_scan_table", _fake_scan_table)
-    rows = await resolve_module._scan_legacy_via_residents(
-        None, AddressQuery.build("Esther St", "02920"))
-    assert rows == []
-    assert calls == ["records_legacy"]
+def test_address_query_strips_like_metacharacters_from_input():
+    """`%` and `_` reach a LIKE pattern through s5_street_norm, so an address
+    carrying one would silently widen the match ("10%" -> every house number
+    starting "10"). They are stripped rather than escaped -- the escape
+    character would itself be normalized. No real US address contains them."""
+    assert AddressQuery.build("10% Main St", "40505").address_prefix == "10 Main"
+    assert AddressQuery.build("1_4 Oak Rd", "40505").address_prefix == "14 Oak"
+    assert "\\" not in AddressQuery.build("12\\3 Elm St", "40505").address_prefix

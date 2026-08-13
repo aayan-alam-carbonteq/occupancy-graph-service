@@ -25,6 +25,7 @@ arrangement this module refuses to have.
 from __future__ import annotations
 
 import argparse
+import logging
 
 import uvicorn
 
@@ -41,6 +42,23 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = build_parser().parse_args()
+    # Configure the ROOT logger, not just uvicorn's.
+    #
+    # uvicorn installs handlers on its own `uvicorn.*` loggers and leaves the
+    # root logger untouched, so without this every `logging.getLogger(__name__)`
+    # line in occupancy_graph is emitted into a logger with no handler and
+    # discarded. Verified against the live corpus 2026-08-11: the container
+    # started, served correctly, and printed NEITHER the redacted DSN it
+    # connected to NOR the address-index preflight result -- the two lines an
+    # operator needs to confirm a deployment is pointed at the right database
+    # with the access paths it requires.
+    #
+    # Set before create_app() because the pool and the preflight both log from
+    # inside the lifespan, which uvicorn.run() drives immediately.
+    logging.basicConfig(
+        level=getattr(logging, args.log_level.upper(), logging.INFO),
+        format="%(levelname)s:     %(name)s - %(message)s",
+    )
     uvicorn.run(create_app(), host=args.host, port=args.port, log_level=args.log_level)
 
 

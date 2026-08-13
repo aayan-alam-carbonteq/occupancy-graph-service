@@ -45,12 +45,19 @@ async def test_records_new_has_all_five_production_partitions(fixture_pool):
 # Every index production carries on records_legacy. Access-path behaviour is
 # the whole point of the clone: a missing index silently changes the plan the
 # experiments are meant to observe.
+#
+# `idx_records_legacy_zip_normaddr` added 2026-08-11, when the partner built it
+# at our ask. Verified against the live catalog that day: present, indisvalid,
+# 61 GB. It is the index the entire address-first access path depends on -- see
+# ddl/005_address_indexes.sql and source/preflight.py, which refuses to serve
+# without it.
 EXPECTED_LEGACY_INDEXES = {
     "records_pkey", "idx_records_zip", "idx_records_lastname_zip_house",
     "idx_records_legacy_zip_house", "idx_records_legacy_state_city",
     "idx_records_first_last", "idx_records_last_name_trgm", "idx_records_dob",
     "idx_records_email", "idx_records_email2", "idx_records_mobile",
     "idx_records_phone", "idx_records_ssn", "idx_records_ssn2",
+    "idx_records_legacy_zip_normaddr",
 }
 
 
@@ -60,6 +67,26 @@ async def test_records_legacy_carries_the_production_index_set(fixture_pool):
             SELECT indexname FROM pg_indexes
             WHERE schemaname='public' AND tablename='records_legacy'""")
     assert {r["indexname"] for r in rows} == EXPECTED_LEGACY_INDEXES
+
+
+async def test_the_address_indexes_are_expression_indexes_on_s5_street_norm(fixture_pool):
+    """The clone must reproduce the EXPRESSION, not merely an index of the same
+    name. resolve.py's predicate is written to match `s5_street_norm(address)`
+    exactly; an index on the bare column would be silently unusable by it while
+    every name-based assertion above still passed."""
+    async with fixture_pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT indexname, indexdef FROM pg_indexes
+            WHERE schemaname='public' AND indexdef LIKE '%s5_street_norm%'""")
+    defs = {r["indexname"]: r["indexdef"] for r in rows}
+    assert "idx_records_legacy_zip_normaddr" in defs
+    assert "idx_p20260301_property_owner_addr" in defs
+    # text_pattern_ops is what makes a prefix LIKE an index CONDITION rather
+    # than a filter; without it the cutover's whole performance claim is void.
+    assert "text_pattern_ops" in defs["idx_records_legacy_zip_normaddr"]
+    # The assessor index is PARTIAL, and the predicate must match the literal
+    # feeds.py emits or the planner cannot prove the index applies.
+    assert "property_owner%" in defs["idx_p20260301_property_owner_addr"]
 
 
 async def test_every_partition_carries_a_record_id_index(fixture_pool):

@@ -1,17 +1,28 @@
 """Address resolution against the partner corpus.
 
-Phase 1 uses the `zip` btree plus a prefix filter on the free-text `address`
-column. This is THE access path: `house_number` is 0% populated on every feed the
-adapter reads, so predicating on it produces a plan that scans.
+Phase 1 uses the composite `(zip, silver.s5_street_norm(address))` index: an
+equality on the ZIP and a PREFIX RANGE on the normalized address, both index
+conditions. `house_number` is 0% populated on every feed this adapter reads, so
+predicating on it produces a plan that scans.
 
-Measured: 173 ms on records_new (1.4 B rows), 1.30 s warm / 32 s cold on
-records_legacy (6.24 B rows).
+THE PREDICATE IS LOAD-BEARING AND MUST NOT BE "SIMPLIFIED" BACK TO ILIKE.
+An expression index is only usable when the query repeats the expression
+verbatim, and `ILIKE` cannot use a btree at all. `address ILIKE $2` -- what this
+module emitted until the partner built the indexes -- degenerates into a heap
+filter over every row in the ZIP (~273k scattered reads at ~195 ms a cold page
+on a 3.7 TB heap). That query was observed server-side ACTIVE at 14+ minutes
+without completing, and cancelled at our own 120 s ceiling on 2026-08-10.
+
+Measured live 2026-08-11 at the real query shapes:
+  phase 1  records_legacy, ZIP 02816 + source_file filters   554 ms, 15 rows
+           (Index Scan using idx_records_legacy_zip_normaddr)
+  phase 2  records_new parent, imported_at-pruned            26 ms
+           (Index Scan using idx_p20260301_property_owner_addr)
 """
 from __future__ import annotations
 
 import json
 import logging
-import os
 from collections import Counter
 from dataclasses import dataclass, field
 
@@ -32,38 +43,63 @@ MAX_ROWS_PER_SHAPE = 200
 
 logger = logging.getLogger(__name__)
 
+# The normalizing function the partner's expression indexes are built on. Every
+# address predicate must wrap BOTH sides in it -- the column so the index is
+# usable at all, the parameter so the two sides agree on suffix spelling.
+STREET_NORM = "silver.s5_street_norm"
+
+# LIKE metacharacters, stripped from address input rather than escaped.
+#
+# The parameter is normalized SERVER-side and then concatenated with '%' to form
+# a LIKE pattern, so a `%` or `_` arriving in an address would be interpreted as
+# a wildcard: "10%" would match every house number in the ZIP beginning "10".
+# Escaping is the usual answer and is wrong here -- the escape character would
+# itself pass through s5_street_norm (which upper-cases and rewrites
+# punctuation), so the escaped pattern and the indexed value would no longer
+# correspond. None of these characters occurs in a real US address, so removing
+# them is both safe and simpler than an ESCAPE clause the normalizer can break.
+_LIKE_METACHARS = str.maketrans({"%": None, "_": None, "\\": None})
+
 
 @dataclass(frozen=True)
 class AddressQuery:
     raw: str
     norm_address: str
     zip5: str
-    like_prefix: str
-    # The leading house-number token ("1104", "12A"), or "" when the address
-    # has none. Drives the resident-hop anchor scan; exact-match against the
-    # partner's text house_number column.
+    # The bare address prefix, WITHOUT a trailing '%'. SQL wraps it in
+    # s5_street_norm and appends the wildcard; see build().
+    address_prefix: str
+    # The leading house-number token ("1104", "12A"), or "" when the address has
+    # none. Retained because callers use it for evidence/labelling; it is no
+    # longer a query predicate -- the partner's house_number column is 0%
+    # populated on the feeds this adapter reads.
     house_number: str = ""
 
     @classmethod
     def build(cls, address: str, zip_code: str | None) -> "AddressQuery":
-        raw = (address or "").strip()
+        raw = (address or "").strip().translate(_LIKE_METACHARS).strip()
         normalized = normalize_address(raw)
-        # Prefix on house number + first street token ONLY: selective enough
-        # to filter a ZIP's worth of rows, loose enough to survive suffix
-        # spelling drift ("RD" vs "ROAD"), missing suffixes, and unit
-        # designators, none of which the free-text column normalizes.
-        # "1104 Spring Run Road" -> "1104 Spring" (not "...Run" or "...Run
-        # Road" -- a longer prefix looks more selective but risks silently
-        # losing rows on any suffix/unit variation, which is worse than the
-        # extra heap-filter cost of a broader prefix). "123 Main St Apt 4" ->
-        # "123 Main" -- the unit designator ("Apt 4") must never enter the
-        # prefix, or it would fail to match a stored row that omits or
-        # abbreviates it differently. Tokenizing (rather than slicing the raw
-        # string) also collapses irregular internal whitespace instead of
-        # baking it into the LIKE pattern. A leading token that merely
-        # *starts* with a digit counts as a house number ("12A"), since
-        # alphanumeric house numbers are real. With no house number at all,
-        # the whole raw string is used unmodified.
+        # Prefix on house number + first street token ONLY, and the index does
+        # NOT change that. s5_street_norm unifies suffix SPELLING ("ROAD" ->
+        # "RD"), so it removes one of the three reasons this prefix is short --
+        # but not the other two, and those are the ones that lose rows:
+        #   * a stored row with NO suffix at all ("101 PEMBROKE") is not
+        #     reachable from a longer prefix ("101 PEMBROKE LN"), and
+        #     normalization cannot invent the missing token;
+        #   * a unit designator ("APT 4") must never enter the prefix, or a
+        #     stored row that omits it -- or writes it differently -- is missed.
+        # A longer prefix therefore still looks more selective while silently
+        # losing rows, which is the worse failure. Selectivity is no longer the
+        # scarce resource anyway: the prefix range is an INDEX condition now,
+        # not a heap filter, so a broader prefix costs index entries rather than
+        # ~195 ms cold pages.
+        #
+        # "1104 Spring Run Road" -> "1104 Spring". "123 Main St Apt 4" ->
+        # "123 Main". Tokenizing (rather than slicing the raw string) also
+        # collapses irregular internal whitespace instead of baking it into the
+        # pattern. A leading token that merely *starts* with a digit counts as a
+        # house number ("12A"), since alphanumeric house numbers are real. With
+        # no house number at all, the whole raw string is used unmodified.
         tokens = raw.split()
         if tokens and tokens[0][:1].isdigit():
             house = tokens[0]
@@ -75,22 +111,30 @@ class AddressQuery:
             raw=raw,
             norm_address=normalized,
             zip5=zip5(zip_code),
-            like_prefix=f"{prefix}%",
+            # BARE value, no trailing '%'. The wildcard is appended in SQL,
+            # AFTER s5_street_norm has run on this parameter -- a '%' carried in
+            # here would be normalized as data and then followed by the real
+            # wildcard, matching a prefix one character shorter than intended.
+            address_prefix=prefix,
             house_number=house,
         )
 
     def matches_prefix(self, address: object) -> bool:
-        """The Python-side equivalent of `address ILIKE like_prefix`.
+        """Case-insensitive startswith against `address_prefix`.
 
-        The resident-hop path fetches rows by indexed equality on columns that
-        are NOT the address (house_number, last_name), so the address filter
-        that the SQL path expressed as ILIKE moves client-side. like_prefix is
-        a startswith pattern by construction (one trailing %), so this is a
-        case-insensitive startswith. (A literal `_` in the prefix is treated
-        as itself here but as a single-char wildcard by ILIKE -- strictly
-        narrower, never broader.)
+        This was the Python mirror of the SQL address filter for the resident
+        hop, which fetched rows by indexed equality on columns that were not the
+        address. The hop is gone -- every scan now filters on the address in SQL
+        through the index -- so no production path calls this; it remains for the
+        clone coverage experiment, which measures anchor density and needs the
+        same prefix semantics the scan uses.
+
+        It compares RAW case-folded text, not s5_street_norm output, so it is
+        strictly narrower than the SQL predicate: a row differing only in suffix
+        spelling matches in SQL and not here. That direction is safe for a
+        coverage floor; do not reuse this to filter scan results.
         """
-        return str(address or "").upper().startswith(self.like_prefix[:-1].upper())
+        return str(address or "").upper().startswith(self.address_prefix.upper())
 
 
 @dataclass
@@ -100,28 +144,11 @@ class ZipScanResult:
     state: str | None = None
 
 
-# When an address index EXISTS, the resident hop is unnecessary -- and it is
-# lossy, because it can only reach residents an anchor feed happens to name.
-#
-# `OCCUPANCY_LEGACY_SCAN=direct` selects the collapsed zip+address scan for
-# records_legacy instead. It is OFF by default because against the live partner
-# corpus that scan does not finish: `address` is unindexed there, so it becomes
-# a heap filter over the whole ZIP (~273k rows at ~195ms a cold page, observed
-# server-side ACTIVE at 14+ minutes without completing).
-#
-# It exists to answer the question the partner ask turns on -- "what do we get
-# back if the index we are requesting is added?" -- against the local clone,
-# where the index can simply be created. That is a question about ACCESS PATHS,
-# which transfer, not about latency, which does not.
-def _direct_legacy_scan_enabled() -> bool:
-    return os.environ.get("OCCUPANCY_LEGACY_SCAN", "").strip().lower() == "direct"
-
-
 async def scan_zip_sources(pool: PartnerPool, query: AddressQuery) -> ZipScanResult:
     result = ZipScanResult(rows_by_shape={shape: [] for shape in ZIP_SHAPES})
     if not query.raw:
-        # An empty address has no prefix worth of its own: `like_prefix` would
-        # be a bare "%", which matches every row in the ZIP (~270k on the real
+        # An empty address has no prefix of its own: the pattern would collapse
+        # to a bare "%", matching every row in the ZIP (~270k on the real
         # corpus) truncated to MAX_ROWS_PER_SHAPE -- silently arbitrary rows
         # presented as a match. Refuse to query at all instead.
         return result
@@ -140,13 +167,10 @@ async def scan_zip_sources(pool: PartnerPool, query: AddressQuery) -> ZipScanRes
         groups = pattern_groups(ZIP_SHAPES, table)
         if not groups:
             continue
-        if table == "records_legacy" and not _direct_legacy_scan_enabled():
-            # The zip+address heap filter does not finish on this table
-            # (observed active at 14+ min). Reach rows via the residents
-            # instead -- indexed equalities only. See _scan_legacy_via_residents.
-            rows = await _scan_legacy_via_residents(pool, query)
-        else:
-            rows = await _scan_table(pool, table, groups, query)
+        # Every table takes the same path now, records_legacy included. It used
+        # to divert through a resident hop because the address filter could not
+        # finish here; that hop cost ~0.35 measured accuracy and is deleted.
+        rows = await _scan_table(pool, table, groups, query)
         for row in rows:
             # A row can belong to more than one shape (loan/drive are the same
             # physical payday row), so this assigns rather than partitions.
@@ -202,18 +226,18 @@ def _collapsed_scan_sql(
 ) -> tuple[str, list[str]]:
     """ONE query covering every shape on `table`, with a per-group row budget.
 
-    WHY THIS IS ONE QUERY AND NOT N. The predicate is
-    `zip = $1 AND address ILIKE $2 AND source_file LIKE ...`, and only `zip` is
-    indexed. `address` and `source_file` are heap filters, so EVERY row in the
-    ZIP must be read off disk to evaluate them. Measured on the live corpus:
-    the backend sits at 100% `IO / DataFileRead` and the planner expects
-    `rows=10` to survive -- so `LIMIT` never short-circuits either, because the
-    scan cannot know it is done until it has read everything.
+    WHY THIS IS ONE QUERY AND NOT N. `zip` and the normalized address prefix are
+    both INDEX conditions on `(zip, s5_street_norm(address))`, but `source_file`
+    is not indexed and remains a heap filter over whatever survives the index
+    range. That residual cost is identical for every shape on the table -- same
+    ZIP, same address prefix, same heap rows -- so running one scan per shape
+    re-read the same rows once per shape to return disjoint handfuls. This reads
+    them once.
 
-    That cost is paid PER SCAN, and it is identical for every shape on the
-    table: same ZIP, same address prefix, same pages. Running one scan per
-    shape re-read the same heap three times over on records_legacy to return
-    three disjoint handfuls of rows. This reads it once.
+    The argument was originally much starker: before the partner built the
+    indexes, `address ILIKE $2` forced EVERY row in the ZIP off disk (~273k
+    scattered reads), so N scans meant N full-ZIP reads. That is fixed, and the
+    collapse is still correct for the smaller reason.
 
     The per-group budget is preserved exactly rather than approximated. A bare
     `LIMIT MAX_ROWS_PER_SHAPE * len(groups)` would let one dense shape consume
@@ -247,7 +271,7 @@ def _collapsed_scan_sql(
                      ) AS _feed_rank
             FROM public.{table}
             WHERE zip = $1
-              AND address ILIKE $2
+              AND {STREET_NORM}(address) LIKE {STREET_NORM}($2) || '%'
               AND ({where_sql})
         ) ranked
         WHERE _feed_rank <= {MAX_ROWS_PER_SHAPE}
@@ -262,7 +286,7 @@ async def _scan_table(
     """Run the collapsed scan for one table. Shape assignment happens in Python."""
     sql, patterns = _collapsed_scan_sql(table, groups)
     async with pool.acquire() as conn:
-        rows = await conn.fetch(sql, query.zip5, query.like_prefix, *patterns)
+        rows = await conn.fetch(sql, query.zip5, query.address_prefix, *patterns)
     out = []
     for row in rows:
         record = dict(row)
@@ -270,128 +294,6 @@ async def _scan_table(
         record.pop("_feed_rank", None)
         out.append(decode_raw_data(record))
     return out
-
-
-# Resident-hop bounds. The anchor scan is one indexed probe; each name hop is
-# one more. All three limits exist to keep the worst case (a very common
-# surname, a dense building) bounded rather than open-ended.
-ANCHOR_LIMIT = 200
-NAME_HOP_LIMIT = 400
-MAX_NAME_HOPS = 8
-
-
-async def _scan_legacy_via_residents(
-    pool: PartnerPool, query: AddressQuery
-) -> list[dict]:
-    """records_legacy WITHOUT the unindexed address heap filter.
-
-    THE ONLY predicates used are indexed equalities, every one verified by raw
-    query against the live corpus on 2026-08-03:
-
-      anchor   zip = $1 AND house_number = $2      0.61 s cold, 63 rows
-      name hop last_name = $1 AND zip = $2         8.8-30.7 s cold, <=400 rows
-
-    versus the collapsed zip scan this replaces, which was observed
-    server-side ACTIVE at 14+ minutes without completing, because `address`
-    and `source_file` are heap filters over ~273k scattered rows at ~195 ms a
-    cold page.
-
-    HOW IT WORKS. `house_number` is populated on the anchor feeds (USCRM,
-    SSNxDOB, phonebook, historic) and NULL on utility/trace -- which is exactly
-    why the old (zip, house_number) probes "proved" feeds missing. So the
-    anchor scan cannot fetch shape rows directly; what it CAN do, in one
-    indexed probe, is name the residents. The name hop then fetches each
-    resident's rows through the (last_name, zip, house_number) btree -- and
-    THOSE include the utility/trace rows, verified live: the hop recovered
-    Trace x3 + Utility x1 at 1104 SPRING RUN RD that no anchor could reach.
-    The address filter the SQL path expressed as ILIKE runs client-side over
-    the handful of fetched rows instead of server-side over the whole ZIP.
-
-    COVERAGE, stated honestly: a resident with NO anchor-feed row is invisible
-    to the hop, so this can return a subset of what the full scan would. The
-    spec's live proof found 36 legacy rows at the subject address; the hop
-    recovers the residents' subset of them. That is the price of viability,
-    it is logged per address, and the alternative was a scan that does not
-    finish.
-
-    Anchors whose source_file happens to match a FEEDS pattern (USCRM is a
-    `base` feed) are themselves shape rows and are kept.
-    """
-    if not query.house_number:
-        # No house number to anchor on -- fall back to the collapsed scan and
-        # accept its cost rather than silently returning nothing.
-        logger.warning("resident hop: no house number in %r; falling back to zip scan",
-                       query.raw)
-        groups = pattern_groups(ZIP_SHAPES, "records_legacy")
-        return await _scan_table(pool, "records_legacy", groups, query)
-
-    rows_by_id: dict[object, dict] = {}
-    async with pool.acquire() as conn:
-        anchors = await conn.fetch(
-            f"SELECT * FROM public.records_legacy"
-            f" WHERE zip = $1 AND house_number = $2 LIMIT {ANCHOR_LIMIT}",
-            query.zip5, query.house_number,
-        )
-        # House 1104 exists on many streets in the ZIP; keep only the subject's.
-        at_address = [dict(r) for r in anchors if query.matches_prefix(r["address"])]
-        for row in at_address:
-            rows_by_id.setdefault(row["record_id"], row)
-
-        names: list[str] = []
-        seen_names: set[str] = set()
-        for row in at_address:
-            name = str(row.get("last_name") or "").strip()
-            if name and name.upper() not in seen_names:
-                seen_names.add(name.upper())
-                names.append(name)
-        if len(names) > MAX_NAME_HOPS:
-            logger.warning("resident hop: %d resident surnames at %r, hopping first %d",
-                           len(names), query.raw, MAX_NAME_HOPS)
-            names = names[:MAX_NAME_HOPS]
-
-        for name in names:
-            # THE ADDRESS FILTER BELONGS IN THE QUERY, NOT AFTER IT.
-            #
-            # This used to select on (last_name, zip) alone and apply
-            # matches_prefix in Python. That silently lost rows whenever a
-            # surname was common in the ZIP: LIMIT bounds the SURNAME's rows
-            # across the whole ZIP, so the handful at the subject address were
-            # frequently not in the slice fetched. Measured on the local clone,
-            # ZIP 40517: COX has 585 rows of which 5 are at the subject address,
-            # MARTIN has 1,147 of which 0 are -- so a 400-row window spent
-            # almost all of its budget on other streets and the hop returned 15%
-            # of the utility rows that were sitting right there. Both surnames
-            # logged the cap warning, which is what exposed it.
-            #
-            # This is NOT a clone artefact -- the same truncation happens live,
-            # and more often, since production's ZIPs are denser.
-            #
-            # The access path is unchanged: (last_name, zip, house_number) still
-            # drives the scan, and `address ILIKE` is a heap filter over that
-            # surname's few hundred rows rather than over the ZIP's ~273k. It is
-            # the same predicate the collapsed zip scan cannot afford, made cheap
-            # by the index having already cut the candidate set by three orders
-            # of magnitude.
-            hop = await conn.fetch(
-                f"SELECT * FROM public.records_legacy"
-                f" WHERE last_name = $1 AND zip = $2 AND address ILIKE $3"
-                f" LIMIT {NAME_HOP_LIMIT}",
-                name, query.zip5, query.like_prefix,
-            )
-            if len(hop) == NAME_HOP_LIMIT:
-                logger.warning("resident hop: surname %r hit the %d-row cap AT the "
-                               "subject address in zip %s; rows beyond it are not seen",
-                               name, NAME_HOP_LIMIT, query.zip5)
-            for r in hop:
-                # Defence in depth: ILIKE treats `_` as a single-char wildcard
-                # while matches_prefix treats it literally, so the Python check
-                # stays as the narrower of the two.
-                if query.matches_prefix(r["address"]):
-                    rows_by_id.setdefault(r["record_id"], dict(r))
-
-    logger.info("resident hop: %d anchors at address, %d surnames, %d rows total",
-                len(at_address), len(names), len(rows_by_id))
-    return [decode_raw_data(row) for row in rows_by_id.values()]
 
 
 @dataclass
@@ -412,15 +314,24 @@ class TaxScanResult:
 async def scan_tax_source(
     pool: PartnerPool, query: AddressQuery, *, city: str | None, state: str | None
 ) -> TaxScanResult:
-    """Phase 2: property_owner rows via the (upper(state), upper(city)) index.
+    """Phase 2: property_owner rows via the assessor index
+    `(upper(state), upper(city), s5_street_norm(address)) WHERE source_file LIKE
+    'property_owner%'`.
 
     property_owner rows have `zip` and `house_number` 0% populated, so the zip
-    index cannot see them. City/state comes from the phase-1 rows.
+    index cannot see them at all. City/state comes from the phase-1 rows.
 
-    Measured: 613 ms warm / 53 s cold. The statement timeout is the guard; on
-    expiry we report tax as absent rather than failing the investigation. The
-    engine degrades correctly on its own — case_quality_and_synthesis flips to
-    run_for_absence and the tax packets skip on their field gate.
+    All three leading columns are index conditions, and the partial predicate
+    matches the literal `feed_clause("tax")` emits, so the planner can prove the
+    index applies. `imported_at` prunes to the one partition that holds the feed
+    (see feeds.py) before the index is even consulted.
+
+    Measured live 2026-08-11: 26 ms, versus 19 s warm / 241 s cold before the
+    index existed -- this was the only query class that ever hit our statement
+    timeout. The timeout remains the guard; on expiry we report tax as absent
+    rather than failing the investigation, and the engine degrades correctly on
+    its own — case_quality_and_synthesis flips to run_for_absence and the tax
+    packets skip on their field gate.
 
     `dropped` counts quality-gate rejections among the rows actually fetched:
     if MAX_ROWS_PER_SHAPE truncates the candidate set, a column-shifted row
@@ -437,13 +348,15 @@ async def scan_tax_source(
         FROM public.records_new
         WHERE upper(state) = $1
           AND upper(city) = $2
-          AND address ILIKE $3
+          AND {STREET_NORM}(address) LIKE {STREET_NORM}($3) || '%'
           AND {clause}
         LIMIT {MAX_ROWS_PER_SHAPE}
     """
     try:
         async with pool.acquire() as conn:
-            rows = await conn.fetch(sql, state_upper, city_upper, query.like_prefix, *patterns)
+            rows = await conn.fetch(
+                sql, state_upper, city_upper, query.address_prefix, *patterns
+            )
     except asyncpg.QueryCanceledError as exc:
         # QueryCanceledError also fires for an admin pg_cancel_backend, not
         # just a statement_timeout expiry -- same sqlstate 57014, only the

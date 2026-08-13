@@ -38,3 +38,31 @@ CREATE TABLE silver.entity_links (
 CREATE INDEX ON silver.entity_links USING btree (hal_id);
 CREATE UNIQUE INDEX ON silver.entity_links USING btree (source_table, record_id);
 CREATE INDEX ON silver.entity_master USING btree (upper(canonical_last_name));
+
+-- ---- silver.s5_street_norm --------------------------------------------------
+-- Dumped VERBATIM from `pg_get_functiondef` on the live corpus 2026-08-11 (only
+-- CREATE FUNCTION -> CREATE OR REPLACE FUNCTION is unchanged, and it already
+-- was). This is not a helper we own: it is the partner's, and the three address
+-- indexes are built ON it, so the clone must carry the identical definition or
+-- local plans diverge from production's for reasons that have nothing to do
+-- with the query under test.
+--
+-- IMMUTABLE is what makes it index-able at all; PARALLEL SAFE and the exact
+-- replacement list are equally load-bearing. Do not "tidy" the nesting: any
+-- change to the output changes the indexed key, and every stored key would have
+-- to be rebuilt for the index to remain correct.
+CREATE OR REPLACE FUNCTION silver.s5_street_norm(t text)
+ RETURNS text
+ LANGUAGE sql
+ IMMUTABLE PARALLEL SAFE
+AS $function$
+  SELECT nullif(trim(
+    regexp_replace(regexp_replace(regexp_replace(regexp_replace(regexp_replace(regexp_replace(
+    regexp_replace(regexp_replace(regexp_replace(regexp_replace(regexp_replace(regexp_replace(
+    regexp_replace(upper(trim(coalesce(t,''))),'\s+',' ','g'),
+    '\ySTREET\y','ST','g'), '\yAVENUE\y','AVE','g'),  '\yROAD\y','RD','g'),
+    '\yDRIVE\y','DR','g'),  '\yLANE\y','LN','g'),      '\yBOULEVARD\y','BLVD','g'),
+    '\yCOURT\y','CT','g'),  '\yPLACE\y','PL','g'),     '\yTERRACE\y','TER','g'),
+    '\yPARKWAY\y','PKWY','g'), '\yHIGHWAY\y','HWY','g'),'\yCIRCLE\y','CIR','g')
+  ),'')
+$function$;

@@ -156,6 +156,55 @@ async def _enable_tcp_keepalives(conn: asyncpg.Connection) -> None:
         logger.warning("could not enable TCP keepalives: %s", exc)
 
 
+def redact_dsn(dsn: str) -> str:
+    """A DSN safe to log: everything but the password, which becomes `***`.
+
+    Logging the connection target at startup is how an operator confirms which
+    corpus a container actually attached to -- the single most common
+    deployment mistake is a stale DSN pointing somewhere harmless-looking.
+    Logging the password with it would put a live credential in every log
+    aggregator, container log and crash report the process ever touches.
+
+    Parsed by hand rather than with urllib: a Postgres password may contain
+    characters that make the DSN not a strictly valid URL, and this must never
+    be the reason startup fails. Anything unparseable is reported as
+    `<unparseable DSN>` -- if we cannot find the password with certainty, we do
+    not guess, because a wrong guess prints it.
+    """
+    scheme, sep, rest = dsn.partition("://")
+    if not sep or "@" not in rest:
+        # No credentials section at all (e.g. a unix-socket or trust DSN), or
+        # something we do not recognise. Emit nothing rather than risk a leak.
+        return f"{scheme}://<no credentials in DSN>" if sep else "<unparseable DSN>"
+    userinfo, _, hostpart = rest.rpartition("@")
+    user, has_password, _ = userinfo.partition(":")
+    if not has_password:
+        return f"{scheme}://{user}@{hostpart}"
+    return f"{scheme}://{user}:***@{hostpart}"
+
+
+def _validate_dsn(dsn: str) -> None:
+    """Fail at startup on a DSN that cannot work, naming what is wrong.
+
+    Only structural checks belong here -- whether the host exists or the
+    password is right is asyncpg's business, and it reports both clearly. What
+    asyncpg reports badly is a value that is not a DSN at all: a bare hostname
+    or a pasted password produces a connection error that reads like a network
+    fault and sends the reader looking at firewalls.
+    """
+    if "://" not in dsn:
+        raise RuntimeError(
+            f"PARTNER_DSN is not a connection URI (got {redact_dsn(dsn)!r}). "
+            "Expected postgresql://USER:PASSWORD@HOST:5432/all_data?sslmode=require"
+        )
+    scheme = dsn.split("://", 1)[0]
+    if scheme not in ("postgres", "postgresql"):
+        raise RuntimeError(
+            f"PARTNER_DSN has scheme {scheme!r}; expected 'postgresql'. "
+            "This service speaks only to Postgres."
+        )
+
+
 def _int_env(name: str, default: int) -> int:
     """Read an int env var, failing closed with a message naming the culprit
     instead of a bare `int()` ValueError — never silently fall back to
@@ -228,7 +277,17 @@ class PartnerPool:
     async def from_env(cls) -> "PartnerPool":
         dsn = os.environ.get("PARTNER_DSN")
         if not dsn:
-            raise RuntimeError("PARTNER_DSN is not set")
+            raise RuntimeError(
+                "PARTNER_DSN is not set. It is the partner Postgres connection "
+                "string and there is no default -- see .env.example for the "
+                "shape and README.md for where the value comes from. In "
+                "compose, it is passed through from the shell or a .env file "
+                "next to compose.yaml; an unset variable there arrives here as "
+                "empty rather than missing, which is why this check treats both "
+                "the same."
+            )
+        _validate_dsn(dsn)
+        logger.info("connecting to partner corpus at %s", redact_dsn(dsn))
         return await cls.create(
             dsn,
             statement_timeout_ms=_int_env(

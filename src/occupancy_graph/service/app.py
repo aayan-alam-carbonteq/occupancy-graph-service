@@ -21,6 +21,7 @@ from starlette.routing import Route
 from occupancy_graph.service import handlers
 from occupancy_graph.source.bundle import BundleCache
 from occupancy_graph.source.pool import PartnerPool
+from occupancy_graph.source.preflight import verify_address_indexes
 
 
 async def _http_exception(request: Request, exc: HTTPException) -> JSONResponse:
@@ -39,14 +40,33 @@ async def _http_exception(request: Request, exc: HTTPException) -> JSONResponse:
 def create_app(*, pool: PartnerPool | None = None, cache: BundleCache | None = None) -> Starlette:
     """Build the app. With `pool` supplied the lifespan is a no-op (tests);
     without it the pool is built from PARTNER_DSN on startup and closed on
-    shutdown."""
+    shutdown.
+
+    The index preflight runs ONLY on a pool this lifespan owns. A caller that
+    supplies its own pool is a test or an embedding harness pointing at a
+    fixture, and those are entitled to a database that does not carry the
+    partner's full index set; making the app refuse to build there would put a
+    live-corpus requirement on every unit test. Production always takes the
+    from_env() branch, which is the one that checks.
+    """
 
     @contextlib.asynccontextmanager
     async def lifespan(app: Starlette) -> AsyncIterator[None]:
         if app.state.pool is None:
             app.state.pool = await PartnerPool.from_env()
-            app.state.cache = BundleCache(app.state.pool)
             owns_pool = True
+            # BEFORE the cache is built and before uvicorn starts serving, so a
+            # missing index surfaces as a container that never passes its
+            # healthcheck rather than as investigations that hang. Deliberately
+            # NOT caught: MissingIndexError must propagate out of the lifespan.
+            try:
+                await verify_address_indexes(app.state.pool)
+            except BaseException:
+                # The pool is already open at this point; without this the
+                # process exits holding partner connections it never released.
+                await app.state.pool.close()
+                raise
+            app.state.cache = BundleCache(app.state.pool)
         else:
             owns_pool = False
         try:

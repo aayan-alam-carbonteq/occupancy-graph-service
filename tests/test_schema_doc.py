@@ -21,8 +21,17 @@ from occupancy_graph.service.schema_doc import ACCESS_PATHS, HINT
 # string rather than pasted into schema_doc.py as a constant, so adding an
 # access path silently rewrites the hint the agent is handed and this test is
 # what stops it going out unnoticed.
+#
+# AMENDED 2026-08-11, deliberately: the leading token was `zip`. The partner
+# built `(zip, silver.s5_street_norm(address))` on records_legacy and every
+# records_new partition, so the address is now reachable and the hint has to say
+# so -- an agent told the fast path is `zip` alone will keep writing
+# `zip = $1 AND address ILIKE ...` and keep getting refused, because the
+# expression index cannot serve ILIKE. Naming the whole expression is the point:
+# the token IS the repair instruction. This pin did its job -- it caught the
+# change and forced this note; it is not a reason to leave the string stale.
 CONTRACT_C_HINT = (
-    "No index supports this predicate. Indexed paths: zip; "
+    "No index supports this predicate. Indexed paths: (zip, s5_street_norm(address)); "
     "(last_name, zip, house_number); (upper(state), upper(city)); ssn; phone; email."
 )
 
