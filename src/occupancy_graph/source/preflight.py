@@ -65,6 +65,20 @@ class MissingIndexError(RuntimeError):
     """Raised in the lifespan, so the container never passes its healthcheck."""
 
 
+# The collation the name-search range scan depends on.
+#
+# search.py resolves a name to hal_ids with `key_value >= 'LAST|FIRST|' AND
+# key_value < 'LAST|FIRST}'`, which is only equivalent to a prefix match when
+# comparison is BYTEWISE. Under a linguistic collation (en_US.utf8 and friends)
+# punctuation is reordered and the upper bound stops bounding what we think:
+# `'DOE|JANE|1980-04-01' < 'DOE|JANE}'` is TRUE under C.UTF-8 and FALSE under
+# en_US.utf8. The failure is silent -- no error, just an empty result for a name
+# that exists -- which is why it is checked here rather than left to surface as
+# "search found nobody". Caught exactly this way when the test fixture, which
+# defaulted to en_US.utf8, disagreed with production.
+EXPECTED_COLLATION = "C.UTF-8"
+
+
 async def verify_address_indexes(pool: PartnerPool) -> None:
     """Raise MissingIndexError unless every required index exists and is valid.
 
@@ -133,3 +147,31 @@ async def verify_address_indexes(pool: PartnerPool) -> None:
         "address index preflight passed: %s",
         ", ".join(name for name, _, _ in REQUIRED_INDEXES),
     )
+    await verify_collation(pool)
+
+
+async def verify_collation(pool: PartnerPool) -> None:
+    """Warn if the database collation is not the one the range scans assume.
+
+    A WARNING, not a refusal, and the asymmetry is deliberate. A missing index
+    makes queries hang, which takes the service down either way, so refusing to
+    start costs nothing. A collation change makes name search return empty --
+    degraded, but every other operation still works, and taking the whole
+    service offline over one path would be the larger outage. The log line is
+    what turns "search finds nobody" from a mystery into a one-line diagnosis.
+    """
+    async with pool.acquire() as conn:
+        collation = await conn.fetchval(
+            "SELECT datcollate FROM pg_database WHERE datname = current_database()"
+        )
+    if collation != EXPECTED_COLLATION:
+        logger.warning(
+            "database collation is %r, expected %r. Name search resolves through a "
+            "byte-range over silver.unique_keys and a linguistic collation reorders "
+            "the punctuation those bounds rely on, so GET /v1/people/search may "
+            "return empty for names that exist. Nothing else is affected. See "
+            "source/search.py::_prefix_upper_bound.",
+            collation, EXPECTED_COLLATION,
+        )
+    else:
+        logger.info("collation preflight passed: %s", collation)

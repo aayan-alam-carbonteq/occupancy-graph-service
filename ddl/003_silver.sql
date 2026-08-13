@@ -39,6 +39,41 @@ CREATE INDEX ON silver.entity_links USING btree (hal_id);
 CREATE UNIQUE INDEX ON silver.entity_links USING btree (source_table, record_id);
 CREATE INDEX ON silver.entity_master USING btree (upper(canonical_last_name));
 
+-- ---- silver.unique_keys ------------------------------------------------------
+-- The partner's blocking keys, PARTITIONED BY key_type exactly as production
+-- is (verified 2026-08-11: unique_keys_name_dob 996 M, _phone 512 M, _ssn 325 M,
+-- _email 261 M, _name_house_zip 258 M). Only the partitions this service reads
+-- are declared -- adding empty ones would model a topology without exercising it.
+--
+-- THE UNIQUE INDEX ON key_value IS THE POINT. search.py::search_people resolves
+-- a name to hal_ids by RANGE-scanning it ('LAST|FIRST|' .. 'LAST|FIRST}'),
+-- because entity_master has no name index and scanning it does not complete.
+-- Without this index here the fixture answers the same query by seq-scanning a
+-- handful of rows -- green tests over a plan production cannot run.
+--
+-- NOTE the opclass is deliberately DEFAULT, matching production. That is why
+-- search_people uses explicit >= / < bounds rather than LIKE: a prefix LIKE
+-- needs text_pattern_ops and, without it, seq-scans (measured live: 18 s vs
+-- 70 ms for the equivalent range).
+CREATE TABLE silver.unique_keys (
+  key_id bigint,
+  key_type varchar(32) NOT NULL,
+  key_value varchar(255) NOT NULL,
+  hal_id char(15),
+  created_at timestamptz,
+  ssn_token text
+) PARTITION BY LIST (key_type);
+
+CREATE TABLE silver.unique_keys_name_dob
+  PARTITION OF silver.unique_keys FOR VALUES IN ('name_dob');
+CREATE TABLE silver.unique_keys_name_house_zip
+  PARTITION OF silver.unique_keys FOR VALUES IN ('name_house_zip');
+
+CREATE UNIQUE INDEX idx_unique_keys_name_dob_value
+  ON silver.unique_keys_name_dob USING btree (key_value) INCLUDE (key_id);
+CREATE UNIQUE INDEX idx_unique_keys_nhz_value
+  ON silver.unique_keys_name_house_zip USING btree (key_value) INCLUDE (key_id);
+
 -- ---- silver.s5_street_norm --------------------------------------------------
 -- Dumped VERBATIM from `pg_get_functiondef` on the live corpus 2026-08-11 (only
 -- CREATE FUNCTION -> CREATE OR REPLACE FUNCTION is unchanged, and it already

@@ -98,3 +98,32 @@ async def test_every_partition_carries_a_record_id_index(fixture_pool):
             WHERE schemaname='public' AND tablename LIKE 'records_partitioned_%'
               AND indexdef ~ '\\(record_id'""")
     assert len({r["tablename"] for r in rows}) == 5
+
+
+async def test_the_fixture_collation_matches_production(fixture_pool):
+    """C.UTF-8, because a range scan's meaning IS its collation.
+
+    search.py resolves a name to hal_ids with `key_value >= 'LAST|FIRST|' AND
+    key_value < 'LAST|FIRST}'`, which equals a prefix match only under bytewise
+    comparison. This fixture defaulted to the postgres image's en_US.utf8, where
+    linguistic rules reorder punctuation and the upper bound stops bounding:
+    `'DOE|JANE|1980-04-01' < 'DOE|JANE}'` is TRUE in production and FALSE there.
+    Name search returned zero rows locally for data that resolves live -- no
+    error, just silence.
+
+    Pinned here rather than left to the compose file because the failure mode is
+    invisible: nothing else in the suite compares strings across a separator, so
+    a drifted collation would surface as one confusing test, not as this.
+    """
+    async with fixture_pool.acquire() as conn:
+        collate = await conn.fetchval(
+            "SELECT datcollate FROM pg_database WHERE datname = current_database()"
+        )
+        prefix_range_holds = await conn.fetchval(
+            "SELECT 'DOE|JANE|1980-04-01' < 'DOE|JANE}'"
+        )
+    assert collate == "C.UTF-8", (
+        f"fixture collation is {collate!r}, production is 'C.UTF-8'. Recreate the "
+        f"fixture volume: docker compose -f tests/docker-compose.fixture.yml down -v"
+    )
+    assert prefix_range_holds, "the separator range bound does not hold under this collation"

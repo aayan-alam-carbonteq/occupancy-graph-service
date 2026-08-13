@@ -5,6 +5,21 @@ services:
       POSTGRES_USER: graph
       POSTGRES_PASSWORD: graph
       POSTGRES_DB: graph_fixture
+      # MUST match production's collation, which is C.UTF-8 (verified:
+      # SELECT datcollate FROM pg_database WHERE datname='all_data').
+      #
+      # This is not cosmetic. search.py resolves a name to hal_ids with a byte
+      # RANGE over silver.unique_keys ('LAST|FIRST|' .. 'LAST|FIRST}') because
+      # that is the only indexed path -- and a range's meaning IS its collation.
+      # The image defaults to en_US.utf8, under which linguistic rules reorder
+      # punctuation and `'DOE|JANE|1980-04-01' < 'DOE|JANE}'` evaluates FALSE.
+      # The fixture therefore returned zero rows for a query that returns them
+      # in production: a test suite disagreeing with production about string
+      # ordering, silently, for every comparison it makes.
+      #
+      # Requires a fresh volume to take effect -- initdb runs once. `docker
+      # compose down -v` (which conftest.py already does) is enough.
+      POSTGRES_INITDB_ARGS: "--locale=C.UTF-8"
     ports:
       - "55432:5432"
     healthcheck:

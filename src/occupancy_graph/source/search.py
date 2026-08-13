@@ -127,10 +127,33 @@ def _entity(row: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def _name_parts(name: str) -> tuple[str, str]:
-    """Split a free-text query into (first, last). The last token is the
-    surname -- the only field entity_master indexes usefully and the only one
-    100% populated. A single token is treated as a surname."""
-    tokens = [token for token in str(name or "").upper().split() if token]
+    """Split a free-text query into (first, last).
+
+    TWO FORMS, and the comma one is not optional. Assessor rows spell owners
+    "LAST, FIRST MIDDLE" -- `CORRELL, REBECCA CHRISTINE` is a verbatim value
+    from the corpus -- and following an owner elsewhere feeds exactly those
+    strings back in here (prompts.ts: "get their name from tax records, resolve
+    them with search_people"). Taking the LAST token as the surname, which is
+    right for "JANE DOE", turns "TURNER, BRIAN" into surname BRIAN and searches
+    for a person who does not exist. Verified live: "TURNER, BRIAN" and
+    "LINVILLE, ROBERT E" both returned nothing while their reversals each
+    returned 200 candidates.
+
+    This was invisible until now only because the query it feeds could not
+    complete: every call was a 500 long before a wrong name could matter.
+
+    Trailing middle names and initials are dropped -- key_value carries exactly
+    one forename, so "GUSTAVE T" must query as "GUSTAVE" or it matches nothing.
+    """
+    raw = str(name or "").upper()
+    if "," in raw:
+        # "LAST, FIRST MIDDLE" -- everything before the first comma is the
+        # surname, which may itself be multi-token ("VAN DYKE, ANNA").
+        last_part, _, first_part = raw.partition(",")
+        last = " ".join(last_part.split())
+        first_tokens = first_part.split()
+        return (first_tokens[0] if first_tokens else ""), last
+    tokens = [token for token in raw.split() if token]
     if not tokens:
         return "", ""
     if len(tokens) == 1:
@@ -138,13 +161,69 @@ def _name_parts(name: str) -> tuple[str, str]:
     return tokens[0], tokens[-1]
 
 
+# How many distinct hal_ids the key scan will consider before ranking.
+#
+# Every candidate costs one cold random read on a 1.2 B-row heap when
+# entity_master is probed (~17 ms each, measured), so this is the knob that
+# trades ranking breadth against latency: 200 candidates measured 3.4 s of the
+# 3.7 s total. It bounds a very common surname; for a rare one the scan ends
+# early and the cap never binds.
+NAME_KEY_CANDIDATE_LIMIT = 200
+
+
+def _prefix_upper_bound(prefix: str) -> str:
+    """The least string greater than every string starting with `prefix`.
+
+    Increments the final character, which turns a prefix match into a half-open
+    RANGE the btree can seek: [prefix, bound). Every prefix built here ends with
+    the '|' separator (0x7C), so the bound ends with '}' (0x7D).
+
+    This is exact ONLY because the database is C.UTF-8 (verified:
+    `SELECT datcollate FROM pg_database WHERE datname='all_data'`), so
+    comparison is bytewise. Under a linguistic collation, punctuation can sort
+    unpredictably and the bound would silently include or exclude the wrong
+    keys. The split_part() predicates in the query below are the guard against
+    exactly that -- they re-check the match on whatever the range returns, so a
+    collation change degrades this to "slower", never to "wrong".
+    """
+    return prefix[:-1] + chr(ord(prefix[-1]) + 1)
+
+
 async def search_people(
     pool: PartnerPool, name: str, *, limit: int
 ) -> tuple[int, list[dict[str, Any]]]:
-    """Name search over entity_master. Returns (total_matches, page).
+    """Name search. Returns (total_matches_considered, page).
 
-    count(*) OVER () is evaluated before LIMIT, so total is the true match
-    count in one round trip rather than a second query or a lie.
+    WHY THIS DOES NOT QUERY entity_master BY NAME. It used to, and against the
+    live corpus that query CANNOT COMPLETE: entity_master holds 1.215 B rows and
+    carries exactly two indexes -- pk_entity_master(hal_id) and a partial
+    idx_entity_master_merged(merged_into_hal_id) WHERE is_merged. Neither covers
+    a name, so `upper(canonical_last_name) = $1` planned as a Parallel Seq Scan
+    at cost 118,367,194 and died on the 20 s statement timeout every time. This
+    surfaced as `GET /v1/people/search` returning HTTP 500 -- 34 of them across
+    one 12-address benchmark, each one an evidence path the engine simply lost.
+
+    THE INDEXED PATH. silver.unique_keys_name_dob stores one row per
+    (surname, forename, dob) with a UNIQUE btree on key_value and the hal_id
+    beside it. key_value is 'LAST|FIRST|YYYY-MM-DD', so a name becomes a prefix,
+    and a prefix over a btree is a range scan. Resolve names to hal_ids there,
+    then reach entity_master through its PRIMARY KEY, which is the one thing it
+    is indexed for. Measured live 2026-08-11: 0.6 s for the key range, 3.4 s for
+    200 PK probes, 3.7 s total -- versus a query that never returned.
+
+    COVERAGE, stated honestly: a name_dob key requires a DOB, so a person whose
+    records carry none has no key here and will not be found. That is a real
+    narrowing versus the old query's intent -- but not versus its behaviour,
+    which was to time out and return nothing at all. A future widening could
+    union unique_keys_name_house_zip, whose keys are 'LAST|HOUSE|ZIP' and so
+    reach DOB-less people; it is not used here because it carries no forename
+    and cannot answer an exact (first, last) query.
+
+    `total` is the number of distinct entities found WITHIN
+    NAME_KEY_CANDIDATE_LIMIT, not the corpus-wide count the old `count(*) OVER
+    ()` promised. That promise was only ever kept by a query that did not
+    return; a bounded, honest count beats an exact one that never arrives. When
+    the cap binds, the value is a floor and is logged as such.
 
     `is_merged IS NOT TRUE` is load-bearing: the graph records its computed
     merges but never applies them, so both sides of a merge remain in
@@ -154,21 +233,47 @@ async def search_people(
     first, last = _name_parts(name)
     if not last:
         return 0, []
+    prefix = f"{last}|{first}|" if first else f"{last}|"
     sql = f"""
+        WITH candidates AS (
+            SELECT DISTINCT hal_id
+            FROM silver.unique_keys_name_dob
+            WHERE key_value >= $1 AND key_value < $2
+              AND split_part(key_value, '|', 1) = $3
+              AND ($4 = '' OR split_part(key_value, '|', 2) = $4)
+              AND hal_id IS NOT NULL
+            LIMIT {NAME_KEY_CANDIDATE_LIMIT}
+        )
         SELECT {_ENTITY_COLUMNS}, count(*) OVER () AS total_count
         FROM silver.entity_master
-        WHERE upper(canonical_last_name) = $1
-          AND ($2 = '' OR upper(canonical_first_name) = $2)
-          AND is_merged IS NOT TRUE
+        JOIN candidates USING (hal_id)
+        WHERE is_merged IS NOT TRUE
         ORDER BY record_count DESC NULLS LAST, hal_id
-        LIMIT $3
+        LIMIT $5
     """
-    async with pool.acquire() as conn:
-        rows = await conn.fetch(sql, last, first, int(limit))
+    try:
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                sql, prefix, _prefix_upper_bound(prefix), last, first, int(limit)
+            )
+    except asyncpg.QueryCanceledError as exc:
+        # Degrade to "no people found", never propagate. This mirrors
+        # resolve.scan_tax_source: one slow evidence path must not become a 500
+        # that the calling heuristic records as a hard error and retries into
+        # its data-call budget. The engine already treats an empty people list
+        # as absence of evidence rather than failure.
+        logger.warning("people search timed out for %r; degrading to empty: %s", name, exc)
+        return 0, []
     if not rows:
         return 0, []
+    total = int(rows[0]["total_count"])
+    if total >= NAME_KEY_CANDIDATE_LIMIT:
+        logger.info(
+            "people search for %r hit the %d-candidate cap; total is a floor",
+            name, NAME_KEY_CANDIDATE_LIMIT,
+        )
     score = 1.0 if first else 0.6
-    return int(rows[0]["total_count"]), [{**_entity(row), "match_score": score} for row in rows]
+    return total, [{**_entity(row), "match_score": score} for row in rows]
 
 
 async def person_for_hal_id(pool: PartnerPool, hal_id: str) -> dict[str, Any] | None:

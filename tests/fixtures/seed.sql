@@ -159,6 +159,30 @@ VALUES
   ('HAL0003', 'RICHARD', 'DOE', '88 ELM ST', 'LEXINGTON', 'KY', '40507', 2, 61.25, false, false, NULL),
   ('HAL0004', 'MARY', 'DOE', '123 MAIN ST', 'LEXINGTON', 'KY', '40505', 1, 33.00, false, true, 'HAL0001');
 
+-- Blocking keys for the four entities above. search_people no longer queries
+-- entity_master by name -- it cannot, production has no name index there (see
+-- source/search.py) -- so it resolves names through THESE keys and then reaches
+-- entity_master by primary key. Without them, name search finds nobody.
+--
+-- key_value is 'LAST|FIRST|YYYY-MM-DD', production's exact format, because the
+-- lookup is a byte-range over that string: a key written 'FIRST|LAST|...' or
+-- lower-cased would fall outside the range the code computes and the search
+-- would silently return empty.
+--
+-- HAL0004 (MARY DOE) gets a key like everyone else. She is is_merged=true, and
+-- the point is that the JOIN's `is_merged IS NOT TRUE` is what excludes her --
+-- not her absence from the key table, which would make the test pass for the
+-- wrong reason.
+INSERT INTO silver.unique_keys (key_id, key_type, key_value, hal_id)
+VALUES
+  (9001, 'name_dob', 'DOE|JANE|1980-04-01',    'HAL0001'),
+  (9002, 'name_dob', 'SMITH|JOHN|1975-11-20',  'HAL0002'),
+  (9003, 'name_dob', 'DOE|RICHARD|1962-02-11', 'HAL0003'),
+  (9004, 'name_dob', 'DOE|MARY|1988-07-30',    'HAL0004'),
+  -- Shares the prefix 'DOE' but not the 'DOE|' separator boundary -- the exact
+  -- case the range upper bound has to exclude.
+  (9005, 'name_dob', 'DOEHRING|ANNA|1991-01-05', NULL);
+
 INSERT INTO silver.entity_links (hal_id, source_table, record_id, match_type, confidence)
 VALUES
   ('HAL0001', 'records_legacy', 1002, 'name_dob', 0.90),

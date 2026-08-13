@@ -145,3 +145,50 @@ async def test_route_order_is_documentation_not_load_bearing(service_pool, servi
     assert [result["id"] for result in search.json()["results"]] == ["hal:HAL0001", "hal:HAL0003"]
     assert person.status_code == 200
     assert person.json()["person"]["id"] == "hal:HAL0001"
+
+
+# --- name parsing: the "LAST, FIRST" form assessor rows actually use ---------
+
+
+def test_name_parts_handles_the_assessor_last_comma_first_form():
+    """`CORRELL, REBECCA CHRISTINE` is a verbatim owner value from the corpus,
+    and prompts.ts routes exactly these strings into search_people when
+    following an owner elsewhere. Parsing the last token as the surname turns
+    "TURNER, BRIAN" into surname BRIAN -- verified live to return nothing, while
+    its reversal returned 200 candidates."""
+    from occupancy_graph.source.search import _name_parts
+
+    assert _name_parts("TURNER, BRIAN") == ("BRIAN", "TURNER")
+    assert _name_parts("CORRELL, REBECCA CHRISTINE") == ("REBECCA", "CORRELL")
+    # A trailing initial must not reach the key: key_value carries exactly one
+    # forename, so "GUSTAVE T" has to query as "GUSTAVE".
+    assert _name_parts("KALOMBO, GUSTAVE T") == ("GUSTAVE", "KALOMBO")
+    # A multi-token surname before the comma stays whole.
+    assert _name_parts("VAN DYKE, ANNA") == ("ANNA", "VAN DYKE")
+
+
+def test_name_parts_still_reads_the_plain_first_last_form():
+    """The comma branch must not regress the form that already worked."""
+    from occupancy_graph.source.search import _name_parts
+
+    assert _name_parts("JANE DOE") == ("JANE", "DOE")
+    assert _name_parts("JACK W LANE") == ("JACK", "LANE")
+    assert _name_parts("DOE") == ("", "DOE")
+    assert _name_parts("") == ("", "")
+
+
+async def test_search_finds_the_same_person_written_either_way(client):
+    """"Jane Doe" and "Doe, Jane" are the same query and must return the same
+    person -- the whole point of the comma branch."""
+    plain = (await client.get("/v1/people/search?name=Jane%20Doe")).json()
+    comma = (await client.get("/v1/people/search?name=Doe%2C%20Jane")).json()
+    assert plain["total_count"] == comma["total_count"] == 1
+    assert plain["results"][0]["id"] == comma["results"][0]["id"]
+
+
+async def test_a_surname_range_does_not_bleed_into_a_longer_surname(client):
+    """DOEHRING shares the prefix 'DOE' but not the 'DOE|' separator boundary.
+    It is seeded precisely so a sloppy upper bound would surface here."""
+    body = (await client.get("/v1/people/search?name=Doe&limit=25")).json()
+    surnames = {r["last_name"].strip().upper() for r in body["results"] if r.get("last_name")}
+    assert "DOEHRING" not in surnames
