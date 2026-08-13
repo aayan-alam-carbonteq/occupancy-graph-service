@@ -106,27 +106,61 @@ async def verify_address_indexes(pool: PartnerPool) -> None:
                 "side schema change: raise it with them before restarting."
             )
 
+        # Matched on (schema, name, RELATION) and the DEFINITION is returned, not
+        # just the name. A name-only check is what the clone-parity suite already
+        # refuses to accept -- tests/clone/test_ddl_matches_production.py says
+        # outright that "an index on the bare column would be silently unusable
+        # while every name-based assertion passed" -- and the production guard
+        # has no more reason to trust a name than the clone does. The partner
+        # rebuilt their entire silver layer inside ten days; an index recreated
+        # on `address` instead of `s5_street_norm(address)`, or in another
+        # schema, keeps the name and loses every property we depend on.
         rows = await conn.fetch(
             """
-            SELECT c.relname AS index_name, i.indisvalid
+            SELECT c.relname AS index_name,
+                   i.indisvalid,
+                   pg_get_indexdef(i.indexrelid) AS indexdef
             FROM pg_index i
             JOIN pg_class c ON c.oid = i.indexrelid
-            WHERE c.relname = ANY($1::text[])
+            JOIN pg_namespace n ON n.oid = c.relnamespace
+            WHERE n.nspname = 'public'
+              AND c.relname = ANY($1::text[])
+              AND i.indrelid = ANY($2::regclass[])
             """,
             [name for name, _, _ in REQUIRED_INDEXES],
+            [relation for _, relation, _ in REQUIRED_INDEXES],
         )
 
-    found = {row["index_name"]: row["indisvalid"] for row in rows}
+    found = {row["index_name"]: row for row in rows}
     problems: list[str] = []
     for name, relation, purpose in REQUIRED_INDEXES:
-        if name not in found:
+        row = found.get(name)
+        if row is None:
             problems.append(f"  {name} on {relation} -- MISSING. Breaks: {purpose}.")
-        elif not found[name]:
+            continue
+        if not row["indisvalid"]:
             problems.append(
                 f"  {name} on {relation} -- present but INVALID (an interrupted "
                 f"CREATE INDEX CONCURRENTLY leaves this state; the planner "
                 f"ignores it). Breaks: {purpose}."
             )
+            continue
+        # The two properties the access path actually rests on. Without the
+        # expression the predicate cannot use the index at all; without the
+        # opclass the prefix LIKE degrades from an index condition to a filter,
+        # which is the difference between 554 ms and a scan that does not finish.
+        indexdef = row["indexdef"] or ""
+        for required, why in (
+            (REQUIRED_FUNCTION.split(".")[-1],
+             "not built on s5_street_norm(address) -- our predicate cannot use it"),
+            ("text_pattern_ops",
+             "missing text_pattern_ops -- the prefix LIKE stops being an index condition"),
+        ):
+            if required not in indexdef:
+                problems.append(
+                    f"  {name} on {relation} -- {why}. Breaks: {purpose}.\n"
+                    f"      definition: {indexdef}"
+                )
 
     if problems:
         raise MissingIndexError(

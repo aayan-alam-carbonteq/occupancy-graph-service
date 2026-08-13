@@ -24,16 +24,34 @@ class _FakeConn:
     interrupted CREATE INDEX CONCURRENTLY.
     """
 
-    def __init__(self, *, function_exists: bool, indexes: dict[str, bool]):
+    def __init__(self, *, function_exists: bool, indexes: dict[str, bool],
+                 defs: dict[str, str] | None = None):
         self._function_exists = function_exists
         self._indexes = indexes
+        self._defs = defs or {}
 
     async def fetchval(self, sql: str, *args):
+        # Both fetchval call sites return a scalar; collation is checked with
+        # one too, and must not be mistaken for the function-existence probe.
+        if "datcollate" in sql:
+            return "C.UTF-8"
         return self._function_exists
 
-    async def fetch(self, sql: str, names):
+    async def fetch(self, sql: str, names, relations=None):
+        # Signature mirrors the real query's parameters ($1 names, $2 relations).
+        # It is spelled out rather than *args so that a change to the production
+        # query's arity fails here instead of silently passing a stale shape --
+        # which is exactly how the earlier version of this fake went stale.
         return [
-            {"index_name": name, "indisvalid": self._indexes[name]}
+            {
+                "index_name": name,
+                "indisvalid": self._indexes[name],
+                "indexdef": self._defs.get(
+                    name,
+                    f"CREATE INDEX {name} ON public.x USING btree "
+                    f"(zip, silver.s5_street_norm(address) text_pattern_ops)",
+                ),
+            }
             for name in names
             if name in self._indexes
         ]
@@ -49,13 +67,28 @@ class _FakePool:
 
 
 def _pool(*, function_exists: bool = True, missing: tuple[str, ...] = (),
-          invalid: tuple[str, ...] = ()) -> _FakePool:
+          invalid: tuple[str, ...] = (),
+          defs: dict[str, str] | None = None) -> _FakePool:
     indexes = {
         name: name not in invalid
         for name, _, _ in preflight.REQUIRED_INDEXES
         if name not in missing
     }
-    return _FakePool(_FakeConn(function_exists=function_exists, indexes=indexes))
+    return _FakePool(_FakeConn(function_exists=function_exists, indexes=indexes, defs=defs))
+
+
+async def test_preflight_refuses_an_index_missing_its_pattern_opclass():
+    """text_pattern_ops is what makes the prefix LIKE an index CONDITION. Without
+    it the index still exists, still has the right name and expression, and still
+    reduces the query to a scan -- the cutover's entire performance claim is
+    void, silently."""
+    with pytest.raises(preflight.MissingIndexError) as exc:
+        await preflight.verify_address_indexes(_pool(defs={
+            "idx_records_legacy_zip_normaddr":
+                "CREATE INDEX idx_records_legacy_zip_normaddr ON public.records_legacy "
+                "USING btree (zip, silver.s5_street_norm(address))",
+        }))
+    assert "text_pattern_ops" in str(exc.value)
 
 
 async def test_preflight_passes_when_every_index_is_present_and_valid(caplog):
@@ -131,3 +164,53 @@ def test_redact_dsn_emits_nothing_it_cannot_parse_with_certainty():
 
 def test_redact_dsn_leaves_a_passwordless_dsn_intact():
     assert redact_dsn("postgresql://user@host:5432/db") == "postgresql://user@host:5432/db"
+
+
+# --- the real SQL, against the real fixture catalog ---------------------------
+
+
+async def test_preflight_runs_its_actual_queries_against_a_real_catalog(fixture_pool):
+    """Every other test here fakes the connection, so `fetchval`/`fetch` never
+    see the catalog statements: a typo in either would ship green while the
+    production guard silently passed everything. The fixture carries all three
+    indexes (ddl/005_address_indexes.sql) and s5_street_norm (ddl/003), so the
+    happy path can be exercised for real."""
+    await preflight.verify_address_indexes(fixture_pool)
+
+
+REAL_LEGACY_INDEX = (
+    "CREATE INDEX idx_records_legacy_zip_normaddr ON public.records_legacy "
+    "USING btree (zip, silver.s5_street_norm(address) text_pattern_ops) "
+    "WHERE zip IS NOT NULL"
+)
+
+
+async def test_preflight_rejects_a_correctly_named_index_on_the_wrong_expression(
+    fixture_db, fixture_pool
+):
+    """The hole a name-only check leaves open. The partner owns these indexes and
+    rebuilt their whole silver layer inside ten days; one recreated on the bare
+    `address` column keeps the name and loses the property the access path rests
+    on.
+
+    The DDL runs on a SEPARATE connection, not through fixture_pool: that pool
+    sets default_transaction_read_only, mirroring the adapter's own, and refuses
+    DDL with ReadOnlySQLTransactionError. That refusal is the pool's guarantee
+    working, so the test routes around it rather than weakening it.
+    """
+    import asyncpg
+
+    ddl = await asyncpg.connect(fixture_db)
+    try:
+        await ddl.execute("DROP INDEX public.idx_records_legacy_zip_normaddr")
+        await ddl.execute(
+            "CREATE INDEX idx_records_legacy_zip_normaddr "
+            "ON public.records_legacy USING btree (zip, address)"
+        )
+        with pytest.raises(preflight.MissingIndexError) as exc:
+            await preflight.verify_address_indexes(fixture_pool)
+        assert "s5_street_norm" in str(exc.value)
+    finally:
+        await ddl.execute("DROP INDEX IF EXISTS public.idx_records_legacy_zip_normaddr")
+        await ddl.execute(REAL_LEGACY_INDEX)
+        await ddl.close()

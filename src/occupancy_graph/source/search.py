@@ -180,11 +180,17 @@ def _prefix_upper_bound(prefix: str) -> str:
 
     This is exact ONLY because the database is C.UTF-8 (verified:
     `SELECT datcollate FROM pg_database WHERE datname='all_data'`), so
-    comparison is bytewise. Under a linguistic collation, punctuation can sort
-    unpredictably and the bound would silently include or exclude the wrong
-    keys. The split_part() predicates in the query below are the guard against
-    exactly that -- they re-check the match on whatever the range returns, so a
-    collation change degrades this to "slower", never to "wrong".
+    comparison is bytewise. Under a linguistic collation, punctuation sorts
+    unpredictably and the bound stops bounding what we think.
+
+    THE split_part() GUARD IS ONE-SIDED, and an earlier version of this
+    docstring claimed otherwise. It re-checks the match on whatever the range
+    RETURNS, so it removes over-inclusion. It cannot recover a row the range
+    EXCLUDED -- and exclusion is the failure actually observed: under en_US.utf8
+    `'DOE|JANE|1980-04-01' < 'DOE|JANE}'` is FALSE, so the fixture returned zero
+    rows for a name that resolves live. A collation change therefore degrades
+    this to WRONG (silently empty), not merely to slow. That is why
+    preflight.verify_collation warns on it and why the fixture pins C.UTF-8.
     """
     return prefix[:-1] + chr(ord(prefix[-1]) + 1)
 
@@ -234,17 +240,40 @@ async def search_people(
     if not last:
         return 0, []
     prefix = f"{last}|{first}|" if first else f"{last}|"
+    # THE LIMIT MUST BOUND THE SCAN, NOT THE DISTINCT SET. This read
+    # `SELECT DISTINCT hal_id ... LIMIT n` in one level, which does not work:
+    # DISTINCT needs a blocking node (Sort->Unique or HashAggregate) and a
+    # blocking node consumes the WHOLE range before LIMIT sees its first row.
+    # The index INCLUDEs key_id, not hal_id, so every key in the range is also
+    # a heap fetch. Measured live 2026-08-11:
+    #     'SMITH|JOHN|'  Limit->Unique->Sort->Index Scan     6.6 s
+    #     'SMITH|'       same shape                          TIMED OUT at 25 s
+    # and a timeout here is caught below and returned as an empty result -- so
+    # the endpoint stops 500-ing and starts quietly reporting that the most
+    # common names in the corpus do not exist. That is strictly worse than the
+    # 500 it replaced: nothing upstream can distinguish it from real absence.
+    #
+    # Bounding the inner scan instead lets the index stream and stop at n rows.
+    # Same name, same data: 0.5 ms. ORDER BY key_value is the index's own order,
+    # so it adds no sort -- and it makes WHICH n rows survive deterministic,
+    # which the unordered form did not (the planner switched between Seq Scan
+    # and Bitmap Heap Scan by selectivity, so two identical requests could rank
+    # different people).
     sql = f"""
-        WITH candidates AS (
-            SELECT DISTINCT hal_id
+        WITH scanned AS (
+            SELECT hal_id
             FROM silver.unique_keys_name_dob
             WHERE key_value >= $1 AND key_value < $2
               AND split_part(key_value, '|', 1) = $3
               AND ($4 = '' OR split_part(key_value, '|', 2) = $4)
               AND hal_id IS NOT NULL
+            ORDER BY key_value
             LIMIT {NAME_KEY_CANDIDATE_LIMIT}
-        )
-        SELECT {_ENTITY_COLUMNS}, count(*) OVER () AS total_count
+        ),
+        candidates AS (SELECT DISTINCT hal_id FROM scanned)
+        SELECT {_ENTITY_COLUMNS},
+               count(*) OVER () AS total_count,
+               (SELECT count(*) FROM scanned) AS scanned_count
         FROM silver.entity_master
         JOIN candidates USING (hal_id)
         WHERE is_merged IS NOT TRUE
@@ -267,10 +296,17 @@ async def search_people(
     if not rows:
         return 0, []
     total = int(rows[0]["total_count"])
-    if total >= NAME_KEY_CANDIDATE_LIMIT:
+    # Cap detection reads scanned_count, NOT total. total is count(*) OVER () on
+    # the OUTER query -- after the entity_master join and after
+    # `is_merged IS NOT TRUE` -- so every merged candidate, and every hal_id with
+    # no entity_master row, pushes it below the cap while the scan was in fact
+    # truncated. In a corpus this module documents as never applying its own
+    # computed merges, that is the common case, and the only operational signal
+    # that results are partial would go quiet exactly when it matters.
+    if int(rows[0]["scanned_count"]) >= NAME_KEY_CANDIDATE_LIMIT:
         logger.info(
-            "people search for %r hit the %d-candidate cap; total is a floor",
-            name, NAME_KEY_CANDIDATE_LIMIT,
+            "people search for %r hit the %d-key scan cap; total (%d) is a floor",
+            name, NAME_KEY_CANDIDATE_LIMIT, total,
         )
     score = 1.0 if first else 0.6
     return total, [{**_entity(row), "match_score": score} for row in rows]

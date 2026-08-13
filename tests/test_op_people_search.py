@@ -188,7 +188,36 @@ async def test_search_finds_the_same_person_written_either_way(client):
 
 async def test_a_surname_range_does_not_bleed_into_a_longer_surname(client):
     """DOEHRING shares the prefix 'DOE' but not the 'DOE|' separator boundary.
-    It is seeded precisely so a sloppy upper bound would surface here."""
+
+    The field is `lastname`, NOT `last_name`. The first version of this test read
+    `r["last_name"]` behind an `if r.get("last_name")` guard, so the set it built
+    was always empty and the assertion could never fail -- a test that guarded
+    nothing while appearing to guard the range bound. Asserting the surnames set
+    is non-empty is what keeps it honest: if the field is ever renamed again,
+    this fails instead of silently passing."""
     body = (await client.get("/v1/people/search?name=Doe&limit=25")).json()
-    surnames = {r["last_name"].strip().upper() for r in body["results"] if r.get("last_name")}
+    surnames = {r["lastname"].strip().upper() for r in body["results"] if r.get("lastname")}
+    assert surnames, "no surnames read from results -- check the result field name"
+    assert surnames == {"DOE"}
     assert "DOEHRING" not in surnames
+
+
+def test_prefix_upper_bound_is_the_least_string_above_the_prefix():
+    """Direct coverage for the range bound itself.
+
+    The integration test above cannot isolate it: DOEHRING is excluded by the
+    lower bound AND by the split_part guard AND by a NULL hal_id, so it would
+    pass even with the bound removed. This asserts the function's contract.
+    """
+    from occupancy_graph.source.search import _prefix_upper_bound
+
+    # '|' is 0x7C, so the bound ends '}' 0x7D -- and every key sharing the
+    # prefix sorts below it under bytewise (C.UTF-8) comparison.
+    assert _prefix_upper_bound("DOE|") == "DOE}"
+    assert _prefix_upper_bound("DOE|JANE|") == "DOE|JANE}"
+    assert "DOE|JANE|1980-04-01" < _prefix_upper_bound("DOE|JANE|")
+    assert "DOE|ZZZZ|9999-12-31" < _prefix_upper_bound("DOE|")
+    # A longer surname must fall OUTSIDE the range -- below it, since letters
+    # sort under '|'. This is the direction that keeps DOEHRING out of a DOE
+    # search, and it is a property of the SEPARATOR, not of the upper bound.
+    assert "DOEHRING|ANNA|1991-01-05" < "DOE|"

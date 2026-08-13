@@ -37,7 +37,25 @@ CREATE TABLE silver.entity_links (
 -- depends on both.
 CREATE INDEX ON silver.entity_links USING btree (hal_id);
 CREATE UNIQUE INDEX ON silver.entity_links USING btree (source_table, record_id);
-CREATE INDEX ON silver.entity_master USING btree (upper(canonical_last_name));
+
+-- entity_master carries EXACTLY TWO indexes, dumped from the live corpus
+-- 2026-08-11. Reproducing that scarcity is the point.
+--
+-- This file used to also declare `btree (upper(canonical_last_name))`, an index
+-- production DOES NOT HAVE, and that single fictional line is why
+-- GET /v1/people/search shipped broken. search_people filtered on exactly that
+-- expression: locally it planned as an index scan and every test passed, while
+-- live it planned as a Parallel Seq Scan over 1.215 B rows at cost 118,367,194
+-- and returned HTTP 500 on every call against production. A clone that invents
+-- an index does not merely fail to catch the bug -- it manufactures the
+-- evidence that the code is fine. Do not add one back; if a name lookup needs
+-- to be fast, it goes through silver.unique_keys (below), which is how
+-- search.py now does it.
+-- The hal_id index is production's pk_entity_master and is already created by
+-- the PRIMARY KEY on the table above -- declaring it again would add a second,
+-- redundant index the clone does not share with production either.
+CREATE INDEX idx_entity_master_merged ON silver.entity_master USING btree (merged_into_hal_id)
+  WHERE is_merged = true;
 
 -- ---- silver.unique_keys ------------------------------------------------------
 -- The partner's blocking keys, PARTITIONED BY key_type exactly as production

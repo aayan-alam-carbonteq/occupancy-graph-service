@@ -69,11 +69,6 @@ class AddressQuery:
     # The bare address prefix, WITHOUT a trailing '%'. SQL wraps it in
     # s5_street_norm and appends the wildcard; see build().
     address_prefix: str
-    # The leading house-number token ("1104", "12A"), or "" when the address has
-    # none. Retained because callers use it for evidence/labelling; it is no
-    # longer a query predicate -- the partner's house_number column is 0%
-    # populated on the feeds this adapter reads.
-    house_number: str = ""
 
     @classmethod
     def build(cls, address: str, zip_code: str | None) -> "AddressQuery":
@@ -102,10 +97,8 @@ class AddressQuery:
         # no house number at all, the whole raw string is used unmodified.
         tokens = raw.split()
         if tokens and tokens[0][:1].isdigit():
-            house = tokens[0]
-            prefix = f"{house} {tokens[1]}" if len(tokens) > 1 else house
+            prefix = f"{tokens[0]} {tokens[1]}" if len(tokens) > 1 else tokens[0]
         else:
-            house = ""
             prefix = raw
         return cls(
             raw=raw,
@@ -116,25 +109,7 @@ class AddressQuery:
             # here would be normalized as data and then followed by the real
             # wildcard, matching a prefix one character shorter than intended.
             address_prefix=prefix,
-            house_number=house,
         )
-
-    def matches_prefix(self, address: object) -> bool:
-        """Case-insensitive startswith against `address_prefix`.
-
-        This was the Python mirror of the SQL address filter for the resident
-        hop, which fetched rows by indexed equality on columns that were not the
-        address. The hop is gone -- every scan now filters on the address in SQL
-        through the index -- so no production path calls this; it remains for the
-        clone coverage experiment, which measures anchor density and needs the
-        same prefix semantics the scan uses.
-
-        It compares RAW case-folded text, not s5_street_norm output, so it is
-        strictly narrower than the SQL predicate: a row differing only in suffix
-        spelling matches in SQL and not here. That direction is safe for a
-        coverage floor; do not reuse this to filter scan results.
-        """
-        return str(address or "").upper().startswith(self.address_prefix.upper())
 
 
 @dataclass

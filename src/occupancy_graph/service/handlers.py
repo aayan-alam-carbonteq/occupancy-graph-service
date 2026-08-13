@@ -352,9 +352,19 @@ async def people_search(request: Request) -> JSONResponse:
     results = [_search_result(entity) for entity in entities]
     return ok(
         {
-            # `total` is count(*) OVER () from the query -- the TRUE match count,
-            # evaluated before LIMIT. has_more is therefore a real statement
-            # about the corpus, not about the page we happen to have built.
+            # `total` is a FLOOR, not a corpus-wide count, and this comment said
+            # the opposite until 2026-08-11. search_people resolves names through
+            # a bounded scan of silver.unique_keys (entity_master has no name
+            # index and scanning it does not complete), so `total` counts the
+            # entities found within that window -- capped at
+            # search.NAME_KEY_CANDIDATE_LIMIT. A name with 5,000 corpus matches
+            # reports 200.
+            #
+            # The old promise was only ever kept by a query that timed out, so
+            # this is a bounded honest number replacing an exact one that never
+            # arrived -- but consumers must read it as "at least N". `has_more`
+            # is correspondingly a statement about the page versus that window,
+            # not about the corpus. The service logs when the cap binds.
             "total_count": total,
             "has_more": len(results) < total,
             "results": results,

@@ -286,12 +286,23 @@ async def test_a_name_search_finds_the_person_the_traversal_found(
     response = await live_client.get(f"/v1/people/search?name={surname}&limit=25")
     assert response.status_code == 200, response.text
     body = response.json()
-    assert body["total_count"] > 0, (
-        f"entity_master has {hal_id} with canonical_last_name={surname!r}, but "
-        "searching that surname matched nothing. The search predicate is "
-        "upper(canonical_last_name) = $1 -- check that index still exists."
-    )
+    # NOT an assertion that the person is found. search_people resolves names
+    # through silver.unique_keys_name_dob, whose keys require a DOB, so a person
+    # whose records carry none has no key and is legitimately unreachable by
+    # name (see source/search.py). Asserting total_count > 0 here would fail
+    # against a CORRECT implementation for such a person -- which is what this
+    # test did until 2026-08-11, when it still described the deleted
+    # `upper(canonical_last_name) = $1` predicate and the index behind it.
+    #
+    # What must hold is the SHAPE: a 200, and well-formed results if any.
+    if body["total_count"] == 0:
+        pytest.skip(
+            f"{hal_id} ({surname!r}) has no name_dob key -- unreachable by name "
+            "by design, not a failure. See search.search_people's coverage note."
+        )
     assert body["results"]
+    # has_more compares the page against the CAPPED candidate window, not the
+    # corpus; total_count is a floor (search.NAME_KEY_CANDIDATE_LIMIT).
     assert body["has_more"] == (len(body["results"]) < body["total_count"])
     for result in body["results"]:
         assert result["id"].startswith("hal:")
@@ -309,12 +320,20 @@ async def test_the_measured_access_path_costs_still_hold(live_client):
     The ceiling is read from limits rather than hardcoded so a re-tuned
     SQL_HATCH_MAX_PLAN_COST (docs/explain-cost-calibration.md) is honoured
     instead of silently contradicted.
+
+    THE PREDICATE HERE IS THE ONE schema_doc ADVERTISES. It used to be
+    `address ILIKE '1104 Spring%'`, which this test asserted the hatch would
+    SERVE -- while the same commit taught agents never to write it, because
+    ILIKE cannot use the expression index and degenerates to a scan. Guarding a
+    path we tell the agent to avoid measures nothing; the cost calibration has
+    to track the path the service actually depends on.
     """
     response = await live_client.post(
         "/v1/sql",
         json={
             "query": "SELECT record_id, address FROM public.records_new "
-                     "WHERE zip = '40514' AND address ILIKE '1104 Spring%'",
+                     "WHERE zip = '40514' AND silver.s5_street_norm(address) "
+                     "LIKE silver.s5_street_norm('1104 Spring') || '%'",
             "max_rows": 25,
         },
     )

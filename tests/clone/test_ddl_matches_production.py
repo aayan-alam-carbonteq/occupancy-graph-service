@@ -127,3 +127,32 @@ async def test_the_fixture_collation_matches_production(fixture_pool):
         f"fixture volume: docker compose -f tests/docker-compose.fixture.yml down -v"
     )
     assert prefix_range_holds, "the separator range bound does not hold under this collation"
+
+
+async def test_entity_master_carries_only_the_two_indexes_production_has(fixture_pool):
+    """The scarcity is the fidelity.
+
+    This file used to declare a third index on `upper(canonical_last_name)` that
+    production does not have, and that one fictional line is why
+    GET /v1/people/search shipped broken: search_people filtered on exactly that
+    expression, planned as an index scan locally, and planned as a Parallel Seq
+    Scan over 1.215 B rows (cost 118,367,194) live -- HTTP 500 on every call.
+
+    A clone that invents an index does not merely fail to catch the bug; it
+    manufactures the evidence that the code is fine. Nothing pinned
+    entity_master's index set, so nothing objected. This is that pin.
+    """
+    async with fixture_pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT indexdef FROM pg_indexes
+            WHERE schemaname='silver' AND tablename='entity_master'""")
+    defs = [r["indexdef"] for r in rows]
+    assert len(defs) == 2, f"expected production's 2 indexes, got {len(defs)}: {defs}"
+    assert any("hal_id" in d and "UNIQUE" in d for d in defs)
+    assert any("merged_into_hal_id" in d for d in defs)
+    # The specific regression: no index may make a NAME lookup look fast here.
+    for d in defs:
+        assert "canonical_last_name" not in d, (
+            "an index on canonical_last_name does not exist in production; "
+            "adding one here re-hides the people-search failure"
+        )
