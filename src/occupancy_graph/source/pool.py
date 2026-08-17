@@ -210,7 +210,14 @@ def _int_env(name: str, default: int) -> int:
     instead of a bare `int()` ValueError — never silently fall back to
     `default` on a malformed value."""
     raw = os.environ.get(name)
-    if raw is None:
+    # An UNSET variable and a variable set to "" (or whitespace) both mean "no value given".
+    # Treating them differently cost a staging deploy: docker compose renders `${VAR:-}` -- a `:-`
+    # with an empty default -- as a variable that IS set, to the empty string. So every optional
+    # tuning var arrived as "", `os.environ.get` returned a non-None "", this skipped the default,
+    # and int("") aborted the lifespan with `must be an integer, got ''`. The container never
+    # served, and the engine surfaced it as "resolve failed: Unable to connect" -- three layers
+    # from the cause. A value nobody set must not be able to do that.
+    if raw is None or not raw.strip():
         return default
     try:
         return int(raw)

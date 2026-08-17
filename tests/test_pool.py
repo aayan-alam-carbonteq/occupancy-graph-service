@@ -670,3 +670,49 @@ def test_keepalive_cadence_detects_death_before_the_command_timeout():
               + pool_module.KEEPALIVE_INTERVAL_SECONDS * pool_module.KEEPALIVE_COUNT)
     assert detect <= pool_module.command_timeout_for(pool_module.DEFAULT_STATEMENT_TIMEOUT_MS) * 3
     assert detect == 90  # 30 idle + 10*6 probes; a value change here is a design change
+
+
+# --- The empty-string env regression (staging incident, 2026-08-17) ---
+
+
+async def test_from_env_treats_empty_tuning_vars_as_unset(fixture_db, monkeypatch):
+    """`docker compose` renders `${VAR:-}` as a variable that IS SET, to "".
+
+    That is how every optional tuning knob reached the container as an empty
+    string, and a `raw is None` check treated "" as a supplied value: int("")
+    aborted the lifespan, uvicorn never served, and the engine reported it as
+    "resolve failed: Unable to connect" -- three layers away from the cause.
+
+    A knob nobody set must be indistinguishable from a knob that is absent.
+    """
+    monkeypatch.setenv("PARTNER_DSN", fixture_db)
+    for var in ("PARTNER_STATEMENT_TIMEOUT_MS", "PARTNER_POOL_MIN", "PARTNER_POOL_MAX"):
+        monkeypatch.setenv(var, "")
+
+    partner = await PartnerPool.from_env()
+    try:
+        async with partner.acquire() as conn:
+            timeout = await conn.fetchval(
+                "SELECT setting FROM pg_settings WHERE name = 'statement_timeout'"
+            )
+        assert timeout == str(pool_module.DEFAULT_STATEMENT_TIMEOUT_MS)
+        assert partner.pool.get_min_size() == 1
+        assert partner.pool.get_max_size() == 8
+    finally:
+        await partner.close()
+
+
+async def test_from_env_still_rejects_a_genuinely_malformed_tuning_var(fixture_db, monkeypatch):
+    """The empty-string allowance must not become a blanket "ignore junk".
+
+    "abc" is someone getting it wrong and must still fail closed and name itself;
+    only "" and whitespace mean "not given".
+    """
+    monkeypatch.setenv("PARTNER_DSN", fixture_db)
+    monkeypatch.setenv("PARTNER_STATEMENT_TIMEOUT_MS", "  ")
+    partner = await PartnerPool.from_env()
+    await partner.close()  # whitespace-only is "not given"
+
+    monkeypatch.setenv("PARTNER_STATEMENT_TIMEOUT_MS", "abc")
+    with pytest.raises(ValueError, match="PARTNER_STATEMENT_TIMEOUT_MS"):
+        await PartnerPool.from_env()

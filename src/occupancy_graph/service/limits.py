@@ -74,7 +74,10 @@ def _float_env(name: str, default: float, *, minimum: float) -> float:
     serialises as bare `NaN`, which is not valid strict JSON.
     """
     raw = os.environ.get(name)
-    if raw is None:
+    # "" means "not given", same as unset -- see source.pool._int_env for the staging incident
+    # that proved it: `${VAR:-}` in compose sets the variable to the empty string, so a
+    # None-only check turns an untouched optional knob into a startup abort.
+    if raw is None or not raw.strip():
         return default
     try:
         value = float(raw)
@@ -97,7 +100,10 @@ def _int_env(name: str, default: int, *, minimum: int, consequence: str = "") ->
     an out-of-range value would actually do, so nobody widens the bound to make
     the error go away."""
     raw = os.environ.get(name)
-    if raw is None:
+    # "" means "not given", same as unset -- see source.pool._int_env for the staging incident
+    # that proved it: `${VAR:-}` in compose sets the variable to the empty string, so a
+    # None-only check turns an untouched optional knob into a startup abort.
+    if raw is None or not raw.strip():
         return default
     try:
         value = int(raw)
