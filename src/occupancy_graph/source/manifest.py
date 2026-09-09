@@ -196,6 +196,26 @@ TRACE = ShapeSpec(
         "home_built_year": raw("Home_Built_Year"),
         "home_purchase_date": raw("Home_Purchase_Date"),
         "income_description": raw("Income_Description"),
+        # X-083. APPENDED, never inserted -- see the "Order is part of the
+        # contract" rule in this module's header.
+        #
+        # The sighting date, and the only per-person date the trace feed has. The
+        # `Trace Skipping Oct 2025` corpus is a QUARTERLY SNAPSHOT SERIES: each
+        # `2025_Historical_database_N/` file is one dated sweep, so a person's row
+        # in file N is an observation of them at that address on that date.
+        # Measured 2026-09-09 at two addresses through resolve.py's own access
+        # path -- 115 WABASH DR gives 23 rows across 23 files and 22 distinct
+        # dates, resolving into per-person spans (STULL 1982-12..2008-01, YU KEVIN
+        # 2013-01..2025-04), and it agrees with the tax recordingDate and USCRM
+        # home_purchase_date independently.
+        #
+        # NOT a lease or move-in date. First sighting is not a move-in, a gap is
+        # not an absence, and spans OVERLAP rather than partition -- the copy rules
+        # in the spec's section 5 are load-bearing, not editorial.
+        #
+        # Values are gated by quality.coerce_trace_field before they reach here;
+        # granularity is quarterly at best, month-precision on the older files.
+        "record_date": raw("Record_Date"),
     },
 )
 

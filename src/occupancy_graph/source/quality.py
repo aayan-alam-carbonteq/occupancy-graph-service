@@ -21,7 +21,17 @@ _OWN_RENT = {
 # production: Record_Date 82.6%, Date_Of_Birth_Year 31.9%,
 # Home_Owner_Renter_Code 14.1%, Number_of_Bedrooms 1.1%.
 _TRACE_PATTERNS: dict[str, re.Pattern[str]] = {
-    "Record_Date": re.compile(r"^(19|20)\d{2}(\d{2}){1,2}$"),
+    # X-083: month and day are RANGE-CHECKED, not just counted. The looser
+    # `(\d{2}){1,2}` form this replaces accepted `200759` -- month 59 -- which is
+    # a real value observed at 1004 SPRING RUN RD, and it would have reached the
+    # model as a date. `Home_Purchase_Date` below still carries the loose form; it
+    # has the same hole, but it is an already-mapped field and tightening it would
+    # silently drop values the engine accepts today, so that is its own change.
+    #
+    # Rejects, all observed in production: `000`, `200759`, the literal `"MICH"`,
+    # and a full ISO timestamp (`2025-03-28 08:21:07.4141302`). Accepts YYYYMM and
+    # YYYYMMDD, which is 98.8%/1.2% of clean values.
+    "Record_Date": re.compile(r"^(19|20)\d{2}(0[1-9]|1[0-2])(0[1-9]|[12]\d|3[01])?$"),
     "Date_Of_Birth_Year": re.compile(r"^(19|20)\d{2}$"),
     "Date_Of_Birth_Month": re.compile(r"^\d{1,2}$"),
     "Date_Of_Birth_Day": re.compile(r"^\d{1,2}$"),
