@@ -139,7 +139,28 @@ async def address_records(request: Request) -> JSONResponse:
 def _public_person(person: dict[str, Any]) -> dict[str, Any]:
     out = {key: person.get(key) for key in _PERSON_KEYS}
     out["sources"] = sorted(person.get("sources") or ())
+    out["first_seen"], out["last_seen"] = _sighting_span(person)
     return out
+
+
+def _sighting_span(person: dict[str, Any]) -> tuple[str | None, str | None]:
+    """X-083 — the first and last month this person was recorded at the address, as `YYYYMM`.
+
+    Read from the person's own trace rows, whose `record_date` the TRACE shape has carried since
+    X-083 §6.1 (already gated by quality.coerce_trace_field, so malformed values arrive as None).
+
+    MONTH precision on purpose. The trace feed is a quarterly snapshot series; a day would imply a
+    precision the data does not have. And these are SIGHTINGS, not a tenancy: the first is not a
+    move-in and a gap is not an absence. Callers must word them that way.
+
+    `(None, None)` when the person has no dated trace row — undated, never a guessed date.
+    """
+    months = sorted(
+        str(row.get("record_date"))[:6]
+        for shape, row in person.get("rows") or ()
+        if shape == "trace" and row.get("record_date")
+    )
+    return (months[0], months[-1]) if months else (None, None)
 
 
 async def address_people(request: Request) -> JSONResponse:

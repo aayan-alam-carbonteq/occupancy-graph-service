@@ -75,7 +75,10 @@ def test_shape_column_lists_match_the_committed_contract_exactly():
         "id", "auto_id", "vin", "zip", "city", "make", "model", "year",
         "phone", "address", "housenumber", "firstname", "lastname",
     )
-    assert len(SHAPES["trace"].columns) == 23
+    # 24 since X-083 appended `record_date`. This count is a TRIPWIRE, not a
+    # formality: the manifest header makes key ORDER part of the wire contract,
+    # so it must only ever move by a deliberate edit here.
+    assert len(SHAPES["trace"].columns) == 24
     assert len(SHAPES["base"].columns) == 33
 
 
